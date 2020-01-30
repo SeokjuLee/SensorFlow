@@ -1,2 +1,4 @@
-# SensorFlow
-BMVC 2019
+# SensorFlow (BMVC 2019)
+
+### Dataset
+- EuRoC-MAV
