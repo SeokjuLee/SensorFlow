@@ -20,18 +20,18 @@
 
 
 ### 200130 ### 
-TRAIN_SET=/data3/seokju/EuRoC_MAV_448/
+TRAIN_SET=/seokju/EuRoC_MAV_448/
 CUDA_VISIBLE_DEVICES=5,7 python train_euroc.py $TRAIN_SET \
 --sfnet SFResNet \
 --num-scales 1 \
---demi-length 1 \
+--max-demi 1 \
 -j 0 \
--b 2 -p 1 -s 0 -f 0.1 --epoch-size 1000 --sequence-length 3 \
+-b 2 -p 1 -s 0.001 -f 0.5 \
+--epoch-size 1000 --sequence-length 3 \
 --with-mask \
 --with-ssim \
---pretrained-sf /data3/seokju/SensorFlow-v2-euroc/checkpoints/211/sfnet_checkpoint_e_ep6.pth.tar \
 --pretrained-disp ./pretrained/dispnet_60_checkpoint.pth.tar \
 --rotation-mode euler \
---seed 2 \
+--seed 5 \
 --name resnet_448_euroc_debug \
 --debug-mode

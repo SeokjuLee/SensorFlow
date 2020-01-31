@@ -34,7 +34,7 @@ class SequenceFolder(data.Dataset):
         transform functions must take in a list a images and a numpy array (usually intrinsics matrix)
     """
 
-    def __init__(self, root, seed=None, train=True, max_demi=1, transform=None, target_transform=None):
+    def __init__(self, root, seed=None, train=True, demi_length=1, transform=None, target_transform=None):
         np.random.seed(seed)
         random.seed(seed)
         self.root = Path(root)
@@ -43,41 +43,41 @@ class SequenceFolder(data.Dataset):
         # scene_list_path = self.root/'val.txt' if train else self.root/'val.txt'
         self.scenes = [self.root/folder[:-1] for folder in open(scene_list_path)]
         self.transform = transform
-        self.train = train
-        self.crawl_folders(max_demi)
+        self.crawl_folders(demi_length)
 
-    def crawl_folders(self, max_demi):
+    def crawl_folders(self, demi_length):
         sequence_set = []
-        shifts_set = []
         '''
             demi_length = 3
             shifts = list(range(-demi_length, demi_length + 1))
             shifts.pop(demi_length)
         '''
-        if self.train:
-            for demi in range(1, max_demi+1):
-                shifts_set.append([-demi, demi])
-        else:
-            shifts_set.append([-1, 1])
+        # demi_length = (sequence_length-1)//2
+        # shifts = list(range(-demi_length, demi_length + 1))
+        # shifts.pop(demi_length)
+        shifts = [-demi_length, demi_length]
 
-        for shifts in shifts_set:
-            for scene in self.scenes:
-                intrinsics = np.genfromtxt(scene/'cam.txt').astype(np.float32).reshape((3, 3))
-                imgs = sorted(scene.files('*.jpg'))
-                with open(scene/'poses.txt') as f:
-                    poses = f.readlines()
-                # with open(scene/'body_poses.txt') as f:
-                #     body_poses = f.readlines()
+        for scene in self.scenes:
+            intrinsics = np.genfromtxt(scene/'cam.txt').astype(np.float32).reshape((3, 3))
+            imgs = sorted(scene.files('*.jpg'))
+            with open(scene/'poses.txt') as f:
+                poses = f.readlines()
+            # with open(scene/'body_poses.txt') as f:
+            #     body_poses = f.readlines()
 
-                if len(imgs) < max(shifts):
-                    continue
-                for i in range(max(shifts), len(imgs)-max(shifts)):
-                    sample = {'intrinsics': intrinsics, 'tgt': imgs[i], 'ref_imgs': [], 
-                              'tgt_pose': np.array(poses[i].split(' ')).astype(np.float32), 'ref_poses': []}  
-                    for j in shifts:
-                        sample['ref_imgs'].append(imgs[i+j])
-                        sample['ref_poses'].append(np.array(poses[i+j].split(' ')).astype(np.float32))
-                    sequence_set.append(sample)
+            if len(imgs) < demi_length:
+                continue
+            for i in range(demi_length, len(imgs)-demi_length):
+                # sample = {'intrinsics': intrinsics, 'tgt': imgs[i], 'ref_imgs': [], 
+                #           'tgt_pose': np.array(poses[i].split(' ')).astype(np.float32), 'ref_poses': [],
+                #           'tgt_body_pose': np.array(body_poses[i].split(' ')).astype(np.float32), 'ref_body_poses': []}
+                sample = {'intrinsics': intrinsics, 'tgt': imgs[i], 'ref_imgs': [], 
+                          'tgt_pose': np.array(poses[i].split(' ')).astype(np.float32), 'ref_poses': []}  
+                for j in shifts:
+                    sample['ref_imgs'].append(imgs[i+j])
+                    sample['ref_poses'].append(np.array(poses[i+j].split(' ')).astype(np.float32))
+                    # sample['ref_body_poses'].append(np.array(body_poses[i+j].split(' ')).astype(np.float32))
+                sequence_set.append(sample)
         random.shuffle(sequence_set)
         self.samples = sequence_set
 

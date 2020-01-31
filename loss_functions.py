@@ -2,7 +2,7 @@ from __future__ import division
 import torch
 from torch import nn
 import torch.nn.functional as F
-from inverse_warp import inverse_warp2, inverse_warp3, compute_rigid_flow
+from inverse_warp import inverse_warp2, inverse_warp3, compute_rigid_flow, fwd_warp_depth
 import math
 from matplotlib import pyplot as plt
 import numpy as np
@@ -65,7 +65,7 @@ def compute_pairwise_warp_loss(ref_img, tgt_img, flow, args):
 
     flow_grid = torch.stack([u_norm, v_norm], dim=-1)    # [B, H, W, 2]
 
-    if np.array(torch.__version__[:3]).astype(float) > 1.2:
+    if np.array(torch.__version__[:3]).astype(float) >= 1.3:
         r2t_img = F.grid_sample(ref_img, flow_grid, align_corners=True)
     else:
         r2t_img = F.grid_sample(ref_img, flow_grid)
@@ -109,7 +109,8 @@ def compute_rigid_flow_loss(tgt_img, ref_imgs, r2t_flows, t2r_flows, tgt_depth, 
             # pdb.set_trace()
             '''
                 
-                plt.close('all'); bb = 0
+                plt.close('all'); 
+                bb = 0
                 aaa = tgt_img[bb].detach().cpu().numpy().transpose(1,2,0) * 0.5 + 0.5
                 bbb = 1/tgt_depth[bb,0].detach().cpu().numpy()
                 ccc = vis_flow(r2t_rig_flow[bb].detach().cpu().numpy().transpose(1,2,0))
@@ -131,22 +132,169 @@ def compute_rigid_flow_loss(tgt_img, ref_imgs, r2t_flows, t2r_flows, tgt_depth, 
                 fig.add_subplot(ea1,ea2,ii); ii += 1;
                 plt.imshow(eee); plt.colorbar(); plt.text(0, 20, "X_r2t_rig_flow", bbox={'facecolor': 'yellow', 'alpha': 0.5}); plt.grid(linestyle=':', linewidth=0.4);
                 fig.add_subplot(ea1,ea2,ii); ii += 1;
-                plt.imshow(fff); plt.colorbar(); plt.text(0, 20, "X_r2t_flow", bbox={'facecolor': 'yellow', 'alpha': 0.5}); plt.grid(linestyle=':', linewidth=0.4);
+                plt.imshow(fff, vmin=eee.min(), vmax=eee.max()); plt.colorbar(); plt.text(0, 20, "X_r2t_flow", bbox={'facecolor': 'yellow', 'alpha': 0.5}); plt.grid(linestyle=':', linewidth=0.4);
                 fig.add_subplot(ea1,ea2,ii); ii += 1;
                 plt.imshow(ggg); plt.colorbar(); plt.text(0, 20, "Y_r2t_rig_flow", bbox={'facecolor': 'yellow', 'alpha': 0.5}); plt.grid(linestyle=':', linewidth=0.4);
                 fig.add_subplot(ea1,ea2,ii); ii += 1;
-                plt.imshow(hhh); plt.colorbar(); plt.text(0, 20, "Y_r2t_flow", bbox={'facecolor': 'yellow', 'alpha': 0.5}); plt.grid(linestyle=':', linewidth=0.4);
+                plt.imshow(hhh, vmin=ggg.min(), vmax=ggg.max()); plt.colorbar(); plt.text(0, 20, "Y_r2t_flow", bbox={'facecolor': 'yellow', 'alpha': 0.5}); plt.grid(linestyle=':', linewidth=0.4);
+                plt.tight_layout(); plt.ion(); plt.show();
+                
+
+                plt.close('all'); 
+                bb = 0
+                aaa = ref_imgs[0][bb].detach().cpu().numpy().transpose(1,2,0) * 0.5 + 0.5
+                bbb = tgt_img[bb].detach().cpu().numpy().transpose(1,2,0) * 0.5 + 0.5
+                ccc = vis_flow(r2t_rig_flow[bb].detach().cpu().numpy().transpose(1,2,0))
+                ddd = vis_flow(t2r_rig_flow[bb].detach().cpu().numpy().transpose(1,2,0))
+                eee = r2t_rig_flow[bb,0].detach().cpu().numpy()
+                fff = t2r_rig_flow[bb,0].detach().cpu().numpy()
+                ggg = r2t_rig_flow[bb,1].detach().cpu().numpy()
+                hhh = t2r_rig_flow[bb,1].detach().cpu().numpy()
+                fig = plt.figure(2, figsize=(12, 13))
+                ea1 = 5; ea2 = 2; ii = 1;
+                fig.add_subplot(ea1,ea2,ii); ii += 1;
+                plt.imshow(aaa); plt.colorbar(); plt.text(0, 20, "ref", bbox={'facecolor': 'yellow', 'alpha': 0.5}); plt.grid(linestyle=':', linewidth=0.4);
+                fig.add_subplot(ea1,ea2,ii); ii += 1;
+                plt.imshow(bbb); plt.colorbar(); plt.text(0, 20, "tgt", bbox={'facecolor': 'yellow', 'alpha': 0.5}); plt.grid(linestyle=':', linewidth=0.4);
+                fig.add_subplot(ea1,ea2,ii); ii += 1;
+                plt.imshow(ccc); plt.colorbar(); plt.text(0, 20, "r2t_rig_flow", bbox={'facecolor': 'yellow', 'alpha': 0.5}); plt.grid(linestyle=':', linewidth=0.4);
+                fig.add_subplot(ea1,ea2,ii); ii += 1;
+                plt.imshow(ddd); plt.colorbar(); plt.text(0, 20, "t2r_rig_flow", bbox={'facecolor': 'yellow', 'alpha': 0.5}); plt.grid(linestyle=':', linewidth=0.4);
+                fig.add_subplot(ea1,ea2,ii); ii += 1;
+                plt.imshow(eee); plt.colorbar(); plt.text(0, 20, "X_r2t_rig_flow", bbox={'facecolor': 'yellow', 'alpha': 0.5}); plt.grid(linestyle=':', linewidth=0.4);
+                fig.add_subplot(ea1,ea2,ii); ii += 1;
+                plt.imshow(fff); plt.colorbar(); plt.text(0, 20, "X_t2r_rig_flow", bbox={'facecolor': 'yellow', 'alpha': 0.5}); plt.grid(linestyle=':', linewidth=0.4);
+                fig.add_subplot(ea1,ea2,ii); ii += 1;
+                plt.imshow(ggg); plt.colorbar(); plt.text(0, 20, "Y_r2t_rig_flow", bbox={'facecolor': 'yellow', 'alpha': 0.5}); plt.grid(linestyle=':', linewidth=0.4);
+                fig.add_subplot(ea1,ea2,ii); ii += 1;
+                plt.imshow(hhh); plt.colorbar(); plt.text(0, 20, "Y_t2r_rig_flow", bbox={'facecolor': 'yellow', 'alpha': 0.5}); plt.grid(linestyle=':', linewidth=0.4);
                 plt.tight_layout(); plt.ion(); plt.show();
 
 
             '''
-            loss1 = F.smooth_l1_loss(r2t_rig_flow[r2t_val_mask.expand(b,2,h,w) > 0], r2t_flow[s][r2t_val_mask.expand(b,2,h,w) > 0])
-            loss2 = F.smooth_l1_loss(t2r_rig_flow[t2r_val_mask.expand(b,2,h,w) > 0], t2r_flow[s][t2r_val_mask.expand(b,2,h,w) > 0])
+            # loss1 = F.smooth_l1_loss(r2t_rig_flow[r2t_val_mask.expand(b,2,h,w) > 0], r2t_flow[s][r2t_val_mask.expand(b,2,h,w) > 0])
+            # loss2 = F.smooth_l1_loss(t2r_rig_flow[t2r_val_mask.expand(b,2,h,w) > 0], t2r_flow[s][t2r_val_mask.expand(b,2,h,w) > 0])
+
+            loss1 = torch.norm(r2t_rig_flow-r2t_flow[s], 2, 1, keepdim=True)[r2t_val_mask>0].mean()
+            loss2 = torch.norm(t2r_rig_flow-t2r_flow[s], 2, 1, keepdim=True)[t2r_val_mask>0].mean()
 
             loss += (loss1 + loss2)
 
     return loss
 
+
+def compute_fwd_rigid_flow_loss(tgt_img, ref_imgs, r2t_flows, t2r_flows, tgt_depth, ref_depths, r2t_poses, t2r_poses, intrinsics, args):
+    loss = 0
+
+    num_scales = min(len(r2t_flows[0]), args.num_scales)
+    for ref_img, r2t_flow, t2r_flow, ref_depth, r2t_pose, t2r_pose in zip(ref_imgs, r2t_flows, t2r_flows, ref_depths, r2t_poses, t2r_poses):
+        for s in range(num_scales):
+            b, _, h, w = r2t_flow[s].size()
+            downscale = tgt_img.size(2)/h
+
+            tgt_img_scaled = F.interpolate(tgt_img, (h, w), mode='area').detach()
+            ref_img_scaled = F.interpolate(ref_img, (h, w), mode='area').detach()
+            tgt_depth_scaled = F.interpolate(tgt_depth, (h, w), mode='area').detach()
+            ref_depth_scaled = F.interpolate(ref_depth, (h, w), mode='area').detach()
+            intrinsic_scaled = torch.cat( (intrinsics[:, 0:2]/downscale, intrinsics[:, 2:]), dim=1 ).detach()
+
+            r2t_rig_flow, r2t_val_mask = compute_fwd_rigid_flow(tgt_depth, r2t_pose, intrinsic_scaled)
+            t2r_rig_flow, t2r_val_mask = compute_fwd_rigid_flow(ref_depth, t2r_pose, intrinsic_scaled)
+
+            t2r_depth, t2r_val_mask = fwd_warp_depth(tgt_depth[:,0], r2t_pose, intrinsic_scaled)
+            r2t_depth, r2t_val_mask = fwd_warp_depth(ref_depth[:,0], t2r_pose, intrinsic_scaled)
+            # pdb.set_trace()
+            '''
+                
+                plt.close('all'); bb = 3
+                aaa = tgt_img[bb].detach().cpu().numpy().transpose(1,2,0) * 0.5 + 0.5
+                bbb = 1/tgt_depth[bb,0].detach().cpu().numpy()
+                ccc = vis_flow(r2t_rig_flow[bb].detach().cpu().numpy().transpose(1,2,0))
+                ddd = vis_flow(r2t_flow[s][bb].detach().cpu().numpy().transpose(1,2,0))
+                eee = r2t_rig_flow[bb,0].detach().cpu().numpy()
+                fff = r2t_flow[s][bb,0].detach().cpu().numpy()
+                ggg = r2t_rig_flow[bb,1].detach().cpu().numpy()
+                hhh = r2t_flow[s][bb,1].detach().cpu().numpy()
+                fig = plt.figure(1, figsize=(11, 11))
+                ea1 = 4; ea2 = 2; ii = 1;
+                fig.add_subplot(ea1,ea2,ii); ii += 1;
+                plt.imshow(aaa); plt.colorbar(); plt.text(0, 20, "tgt", bbox={'facecolor': 'yellow', 'alpha': 0.5}); plt.grid(linestyle=':', linewidth=0.4);
+                fig.add_subplot(ea1,ea2,ii); ii += 1;
+                plt.imshow(bbb); plt.colorbar(); plt.text(0, 20, "tgt_depth", bbox={'facecolor': 'yellow', 'alpha': 0.5}); plt.grid(linestyle=':', linewidth=0.4);
+                fig.add_subplot(ea1,ea2,ii); ii += 1;
+                plt.imshow(ccc); plt.colorbar(); plt.text(0, 20, "r2t_rig_flow", bbox={'facecolor': 'yellow', 'alpha': 0.5}); plt.grid(linestyle=':', linewidth=0.4);
+                fig.add_subplot(ea1,ea2,ii); ii += 1;
+                plt.imshow(ddd); plt.colorbar(); plt.text(0, 20, "r2t_flow", bbox={'facecolor': 'yellow', 'alpha': 0.5}); plt.grid(linestyle=':', linewidth=0.4);
+                fig.add_subplot(ea1,ea2,ii); ii += 1;
+                plt.imshow(eee); plt.colorbar(); plt.text(0, 20, "X_r2t_rig_flow", bbox={'facecolor': 'yellow', 'alpha': 0.5}); plt.grid(linestyle=':', linewidth=0.4);
+                fig.add_subplot(ea1,ea2,ii); ii += 1;
+                plt.imshow(fff, vmin=eee.min(), vmax=eee.max()); plt.colorbar(); plt.text(0, 20, "X_r2t_flow", bbox={'facecolor': 'yellow', 'alpha': 0.5}); plt.grid(linestyle=':', linewidth=0.4);
+                fig.add_subplot(ea1,ea2,ii); ii += 1;
+                plt.imshow(ggg); plt.colorbar(); plt.text(0, 20, "Y_r2t_rig_flow", bbox={'facecolor': 'yellow', 'alpha': 0.5}); plt.grid(linestyle=':', linewidth=0.4);
+                fig.add_subplot(ea1,ea2,ii); ii += 1;
+                plt.imshow(hhh, vmin=ggg.min(), vmax=ggg.max()); plt.colorbar(); plt.text(0, 20, "Y_r2t_flow", bbox={'facecolor': 'yellow', 'alpha': 0.5}); plt.grid(linestyle=':', linewidth=0.4);
+                plt.tight_layout(); plt.ion(); plt.show();
+                
+
+                plt.close('all'); bb = 1
+                aaa = ref_imgs[0][bb].detach().cpu().numpy().transpose(1,2,0) * 0.5 + 0.5
+                bbb = tgt_img[bb].detach().cpu().numpy().transpose(1,2,0) * 0.5 + 0.5
+                ccc = vis_flow(r2t_rig_flow[bb].detach().cpu().numpy().transpose(1,2,0))
+                ddd = vis_flow(t2r_rig_flow[bb].detach().cpu().numpy().transpose(1,2,0))
+                eee = r2t_rig_flow[bb,0].detach().cpu().numpy()
+                fff = t2r_rig_flow[bb,0].detach().cpu().numpy()
+                ggg = r2t_rig_flow[bb,1].detach().cpu().numpy()
+                hhh = t2r_rig_flow[bb,1].detach().cpu().numpy()
+                fig = plt.figure(1, figsize=(12, 13))
+                ea1 = 5; ea2 = 2; ii = 1;
+                fig.add_subplot(ea1,ea2,ii); ii += 1;
+                plt.imshow(aaa); plt.colorbar(); plt.text(0, 20, "ref", bbox={'facecolor': 'yellow', 'alpha': 0.5}); plt.grid(linestyle=':', linewidth=0.4);
+                fig.add_subplot(ea1,ea2,ii); ii += 1;
+                plt.imshow(bbb); plt.colorbar(); plt.text(0, 20, "tgt", bbox={'facecolor': 'yellow', 'alpha': 0.5}); plt.grid(linestyle=':', linewidth=0.4);
+                fig.add_subplot(ea1,ea2,ii); ii += 1;
+                plt.imshow(ccc); plt.colorbar(); plt.text(0, 20, "r2t_rig_flow", bbox={'facecolor': 'yellow', 'alpha': 0.5}); plt.grid(linestyle=':', linewidth=0.4);
+                fig.add_subplot(ea1,ea2,ii); ii += 1;
+                plt.imshow(ddd); plt.colorbar(); plt.text(0, 20, "t2r_rig_flow", bbox={'facecolor': 'yellow', 'alpha': 0.5}); plt.grid(linestyle=':', linewidth=0.4);
+                fig.add_subplot(ea1,ea2,ii); ii += 1;
+                plt.imshow(eee); plt.colorbar(); plt.text(0, 20, "X_r2t_rig_flow", bbox={'facecolor': 'yellow', 'alpha': 0.5}); plt.grid(linestyle=':', linewidth=0.4);
+                fig.add_subplot(ea1,ea2,ii); ii += 1;
+                plt.imshow(fff); plt.colorbar(); plt.text(0, 20, "X_t2r_rig_flow", bbox={'facecolor': 'yellow', 'alpha': 0.5}); plt.grid(linestyle=':', linewidth=0.4);
+                fig.add_subplot(ea1,ea2,ii); ii += 1;
+                plt.imshow(ggg); plt.colorbar(); plt.text(0, 20, "Y_r2t_rig_flow", bbox={'facecolor': 'yellow', 'alpha': 0.5}); plt.grid(linestyle=':', linewidth=0.4);
+                fig.add_subplot(ea1,ea2,ii); ii += 1;
+                plt.imshow(hhh); plt.colorbar(); plt.text(0, 20, "Y_t2r_rig_flow", bbox={'facecolor': 'yellow', 'alpha': 0.5}); plt.grid(linestyle=':', linewidth=0.4);
+                plt.tight_layout(); plt.ion(); plt.show();
+                
+                
+                
+                
+
+                plt.close('all'); bb = 1
+                aaa = ref_img[bb].detach().cpu().numpy().transpose(1,2,0) * 0.5 + 0.5
+                bbb = tgt_img[bb].detach().cpu().numpy().transpose(1,2,0) * 0.5 + 0.5
+                ccc = ref_depth[bb,0].detach().cpu().numpy()
+                ddd = tgt_depth[bb,0].detach().cpu().numpy()
+                eee = t2r_depth[bb].detach().cpu().numpy()
+                fff = t2r_val_mask[bb].detach().cpu().numpy()
+                fig = plt.figure(1, figsize=(12, 13))
+                ea1 = 3; ea2 = 2; ii = 1;
+                fig.add_subplot(ea1,ea2,ii); ii += 1;
+                plt.imshow(aaa); plt.colorbar(); plt.text(0, 20, "ref", bbox={'facecolor': 'yellow', 'alpha': 0.5}); plt.grid(linestyle=':', linewidth=0.4);
+                fig.add_subplot(ea1,ea2,ii); ii += 1;
+                plt.imshow(bbb); plt.colorbar(); plt.text(0, 20, "tgt", bbox={'facecolor': 'yellow', 'alpha': 0.5}); plt.grid(linestyle=':', linewidth=0.4);
+                fig.add_subplot(ea1,ea2,ii); ii += 1;
+                plt.imshow(ccc); plt.colorbar(); plt.text(0, 20, "r2t_rig_flow", bbox={'facecolor': 'yellow', 'alpha': 0.5}); plt.grid(linestyle=':', linewidth=0.4);
+                fig.add_subplot(ea1,ea2,ii); ii += 1;
+                plt.imshow(ddd); plt.colorbar(); plt.text(0, 20, "t2r_rig_flow", bbox={'facecolor': 'yellow', 'alpha': 0.5}); plt.grid(linestyle=':', linewidth=0.4);
+                fig.add_subplot(ea1,ea2,ii); ii += 1;
+                plt.imshow(eee); plt.colorbar(); plt.text(0, 20, "X_r2t_rig_flow", bbox={'facecolor': 'yellow', 'alpha': 0.5}); plt.grid(linestyle=':', linewidth=0.4);
+                fig.add_subplot(ea1,ea2,ii); ii += 1;
+                plt.imshow(fff); plt.colorbar(); plt.text(0, 20, "X_t2r_rig_flow", bbox={'facecolor': 'yellow', 'alpha': 0.5}); plt.grid(linestyle=':', linewidth=0.4);
+                plt.tight_layout(); plt.ion(); plt.show();
+
+            '''
+
+    return loss
 
 
 
