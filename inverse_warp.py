@@ -1,6 +1,7 @@
 from __future__ import division
 import torch
 import torch.nn.functional as F
+from torch_sparse import coalesce
 import pdb
 
 pixel_coords = None
@@ -228,6 +229,27 @@ def cam2pixel2(cam_coords, proj_c2p_rot, proj_c2p_tr, padding_mode):
     return pixel_coords.reshape(b, h, w, 2), Z.reshape(b, 1, h, w)
 
 
+def cam2pix_trans(cam_coords, pose_mat, intrinsics):
+    b, _, h, w = cam_coords.size()
+    rot, tr = pose_mat[:,:,:3], pose_mat[:,:,-1:]           # [B, 3, 3], [B, 3, 1]
+    cam_coords_flat = cam_coords.reshape(b, 3, -1)          # [B, 3, H*W]
+    cam_coords_trans = rot @ cam_coords_flat                # [B, 3, H*W]
+    cam_coords_trans = cam_coords_trans + tr                # [B, 3, H*W]
+
+    X = cam_coords_trans[:, 0]                              # [B, H*W]
+    Y = cam_coords_trans[:, 1]                              # [B, H*W]
+    Z = cam_coords_trans[:, 2].clamp(min=1e-3)              # [B, H*W]
+
+    X_norm = (X / Z)                                        # [B, H*W]
+    Y_norm = (Y / Z)                                        # [B, H*W]
+    Z_norm = (Z / Z)                                        # [B, H*W]
+    P_norm = torch.stack([X_norm, Y_norm, Z_norm], dim=1)       # [B, 3, H*W]
+    pix_coords = (intrinsics @ P_norm).permute(0,2,1)[:,:,:2]   # [B, H*W, 2]
+    # pdb.set_trace()
+
+    return pix_coords.reshape(b, h, w, 2), Z.reshape(b, 1, h, w)
+
+
 def inverse_warp2(img, depth, ref_depth, pose, intrinsics, padding_mode='zeros'):
     """
     Inverse warp a source image to the target image plane.
@@ -334,3 +356,51 @@ def compute_rigid_flow(depth, pose, intrinsics, padding_mode='zeros'):
     rig_flow = torch.stack((X_flow, Y_flow), dim=1) * valid_mask
 
     return rig_flow, valid_mask
+
+
+def fwd_warp_depth(depth, pose, intrinsics, upscale=2, rotation_mode='euler', padding_mode='zeros'):
+    """
+    Inverse warp a source image to the target image plane.
+    Args:
+        img: the source image (where to sample pixels) -- [B, 3, H, W]
+        depth: depth map of the target image -- [B, H, W]
+        pose: 6DoF pose parameters from target to source -- [B, 4, 4]
+        intrinsics: camera intrinsic matrix -- [B, 3, 3]
+    Returns:
+        projected_img: Source image warped to the target image plane
+        valid_points: Boolean array indicating point validity
+    """
+    check_sizes(depth, 'depth', 'BHW')
+    check_sizes(pose, 'pose', 'B44')
+    check_sizes(intrinsics, 'intrinsics', 'B33')
+
+    b, h, w = depth.size()
+    depth_u = F.interpolate(depth.unsqueeze(1), scale_factor=upscale).squeeze(1)
+    intrinsic_u = torch.cat((intrinsics[:, 0:2]*upscale, intrinsics[:, 2:]), dim=1)
+    # pdb.set_trace()
+
+    # cam_coords = pixel2cam(depth, intrinsics.inverse())     # [B,3,H,W]
+    cam_coords = pixel2cam(depth_u, intrinsic_u.inverse())     # [B,3,H,W]
+    
+    pose_mat = pose[:,:3,:]                                    # [B,3,4]
+
+    pcoords, Z = cam2pix_trans(cam_coords, pose_mat, intrinsics)
+
+    depth_w, valid_w = [], []
+    for coo, z in zip(pcoords, Z):
+        idx = coo.reshape(-1,2).permute(1,0).long()[[1,0]]
+        val = z.reshape(-1)
+        idx[0][idx[0]<0] = h
+        idx[0][idx[0]>h-1] = h
+        idx[1][idx[1]<0] = w
+        idx[1][idx[1]>w-1] = w
+        _idx, _val = coalesce(idx, 1/val, m=h+1, n=w+1, op='max')
+        depth_w.append( 1/torch.sparse.FloatTensor(_idx, _val, torch.Size([h+1,w+1])).to_dense()[:-1,:-1] )
+        valid_w.append( 1- (torch.sparse.FloatTensor(_idx, _val, torch.Size([h+1,w+1])).to_dense()[:-1,:-1]==0).float() )
+        # pdb.set_trace()
+    depth_w = torch.stack(depth_w, dim=0)
+    valid_w = torch.stack(valid_w, dim=0)
+
+    depth_w[valid_w==0] = 0
+
+    return depth_w, valid_w

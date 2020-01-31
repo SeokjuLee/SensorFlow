@@ -68,7 +68,7 @@ def downsample_conv(in_planes, out_planes, kernel_size=3):
 def predict_flow(in_planes):
     return nn.Sequential(
         nn.Conv2d(in_planes, 2, kernel_size=3, padding=1),
-        nn.Sigmoid()
+        # nn.Sigmoid()
     )
 
 

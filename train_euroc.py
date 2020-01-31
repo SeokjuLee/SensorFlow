@@ -13,7 +13,7 @@ import custom_transforms
 
 import models
 from utils import save_checkpoint
-from loss_functions import compute_photo_loss, compute_flow_smooth_loss, compute_rigid_flow_loss, compute_smooth_loss, compute_photo_and_geometry_loss, compute_errors
+from loss_functions import compute_photo_loss, compute_flow_smooth_loss, compute_rigid_flow_loss, compute_errors
 from logger import TermLogger, AverageMeter
 from tensorboardX import SummaryWriter
 
@@ -27,6 +27,8 @@ parser.add_argument('data', metavar='DIR', help='path to dataset')
 parser.add_argument('--sequence-length', type=int, metavar='N',
                     help='sequence length for training', default=3)
 parser.add_argument('--demi-length', type=int, metavar='N',
+                    help='demi length for training', default=1)
+parser.add_argument('--max-demi', type=int, metavar='N',
                     help='demi length for training', default=1)
 parser.add_argument('--dataset-format', default='sequential', metavar='STR',
                     help='dataset format, stacked: stacked frames (from original TensorFlow code) \
@@ -86,6 +88,8 @@ parser.add_argument('--name', dest='name', type=str, required=True,
                     help='name of the experiment, checkpoints are stored in checpoints/name')
 parser.add_argument('--debug-mode', action='store_true', help='debug mode or not')
 parser.add_argument('--rotation-mode', dest='rotation_mode', type=str, default='quaternion', choices=['quaternion', 'euler', '6D'], help='encoding rotation mode')
+parser.add_argument('--fwd-warp', action='store_true', help='forward-warp mode or not')
+
 
 best_error = -1
 n_iter = 0
@@ -137,7 +141,7 @@ def main():
         transform=train_transform,
         seed=args.seed,
         train=True,
-        demi_length=args.demi_length
+        max_demi=args.max_demi
     )
 
     # if no Groundtruth is avalaible, Validation set is the same type as training set to measure photometric loss from warping
@@ -153,7 +157,7 @@ def main():
             transform=valid_transform,
             seed=args.seed,
             train=False,
-            demi_length=args.demi_length
+            max_demi=args.max_demi
         )
     print('{} samples found in {} train scenes'.format(
         len(train_set), len(train_set.scenes)))
@@ -336,7 +340,10 @@ def train(args, train_loader, sf_net, disp_net, optimizer, epoch_size, logger, t
         tgt_depth = 1/disp_net(tgt_img).detach()
         ref_depths = [1/disp_net(ref_img).detach() for ref_img in ref_imgs]
 
-        r2t_flows, t2r_flows = compute_flow(sf_net, tgt_img, ref_imgs, r2t_poses_c, t2r_poses_c)
+        if args.fwd_warp:
+            r2t_flows, t2r_flows = compute_fwd_flow(sf_net, tgt_img, ref_imgs, r2t_poses_c, t2r_poses_c)
+        else:
+            r2t_flows, t2r_flows = compute_flow(sf_net, tgt_img, ref_imgs, r2t_poses_c, t2r_poses_c)
         # poses, poses_inv = compute_pose_with_inv(pose_net, tgt_img, ref_imgs)
         # pdb.set_trace()
         '''
@@ -365,7 +372,6 @@ def train(args, train_loader, sf_net, disp_net, optimizer, epoch_size, logger, t
         loss_1 = compute_photo_loss(tgt_img, ref_imgs, r2t_flows, t2r_flows, args)
         loss_2 = compute_flow_smooth_loss(r2t_flows, tgt_img, t2r_flows, ref_imgs)
         loss_3 = compute_rigid_flow_loss(tgt_img, ref_imgs, r2t_flows, t2r_flows, tgt_depth, ref_depths, r2t_poses, t2r_poses, intrinsics, args)
-
 
         # loss = w1*loss_1 + w2*loss_2
         loss = w1*loss_1 + w2*loss_2 + w3*loss_3
@@ -576,6 +582,17 @@ def compute_flow(sf_net, tgt_img, ref_imgs, r2t_poses, t2r_poses):
 
     return r2t_flows, t2r_flows
 
+
+def compute_fwd_flow(sf_net, tgt_img, ref_imgs, r2t_poses, t2r_poses):
+    t2r_flows = []
+    for ref_img, r2t_pose in zip(ref_imgs, r2t_poses):
+        t2r_flows.append( sf_net(ref_img, r2t_pose) )
+
+    r2t_flows = []
+    for t2r_pose in t2r_poses:
+        r2t_flows.append( sf_net(tgt_img, t2r_pose) )
+
+    return r2t_flows, t2r_flows
 
 
 def compute_pose_with_inv(pose_net, tgt_img, ref_imgs):
