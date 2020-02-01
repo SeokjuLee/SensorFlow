@@ -88,14 +88,14 @@ class RandomHorizontalFlip(object):
 
 
 class RandomScaleCrop(object):
-    """Randomly zooms images up to 15% and crop them to keep same size as before."""
+    """Randomly zooms images up to 5% and crop them to keep same size as before."""
 
     def __call__(self, images, intrinsics, poses):
         assert intrinsics is not None
         output_intrinsics = np.copy(intrinsics)
 
         in_h, in_w, _ = images[0].shape
-        x_scaling, y_scaling = np.random.uniform(1, 1.15, 2)
+        x_scaling, y_scaling = np.random.uniform(1, 1.05, 2)
         scaled_h, scaled_w = int(in_h * y_scaling), int(in_w * x_scaling)
 
         output_intrinsics[0] *= x_scaling
