@@ -88,7 +88,7 @@ parser.add_argument('--name', dest='name', type=str, required=True,
                     help='name of the experiment, checkpoints are stored in checpoints/name')
 parser.add_argument('--debug-mode', action='store_true', help='debug mode or not')
 parser.add_argument('--rotation-mode', dest='rotation_mode', type=str, default='quaternion', choices=['quaternion', 'euler', '6D'], help='encoding rotation mode')
-parser.add_argument('--fwd-flow', action='store_true', help='forward-flow mode or not')
+parser.add_argument('--fwd-warp', action='store_true', help='forward-warp mode or not')
 
 
 best_error = -1
@@ -157,8 +157,7 @@ def main():
             transform=valid_transform,
             seed=args.seed,
             train=False,
-            max_demi=args.max_demi,
-            proportion=10
+            max_demi=args.max_demi
         )
     print('{} samples found in {} train scenes'.format(
         len(train_set), len(train_set.scenes)))
@@ -268,6 +267,16 @@ def main():
         # remember lowest error and save checkpoint
         is_best = decisive_error < best_error
         best_error = min(best_error, decisive_error)
+        # save_checkpoint(
+        #     epoch,
+        #     args.save_path, {
+        #         'epoch': epoch + 1,
+        #         'state_dict': sf_net.module.state_dict()
+        #     }, {
+        #         'epoch': epoch + 1,
+        #         'state_dict': pose_net.module.state_dict()
+        #     },
+        #     is_best)
         save_checkpoint(
             epoch,
             args.save_path, {
@@ -331,7 +340,7 @@ def train(args, train_loader, sf_net, disp_net, optimizer, epoch_size, logger, t
         tgt_depth = 1/disp_net(tgt_img).detach()
         ref_depths = [1/disp_net(ref_img).detach() for ref_img in ref_imgs]
 
-        if args.fwd_flow:
+        if args.fwd_warp:
             r2t_flows, t2r_flows = compute_fwd_flow(sf_net, tgt_img, ref_imgs, r2t_poses_c, t2r_poses_c)
         else:
             r2t_flows, t2r_flows = compute_flow(sf_net, tgt_img, ref_imgs, r2t_poses_c, t2r_poses_c)
@@ -432,17 +441,13 @@ def validate_without_gt(args, val_loader, sf_net, epoch, logger):
         t2r_poses = convert_pose(t2r_poses, output_rot_mode=args.rotation_mode)
 
         # compute output
-        r2t_flows, t2r_flows = [], []
-        if args.fwd_flow:
-            for t2r_pose in t2r_poses:
-                r2t_flows.append( [sf_net(tgt_img, t2r_pose)] )
-            for ref_img, r2t_pose in zip(ref_imgs, r2t_poses):
-                t2r_flows.append( [sf_net(ref_img, r2t_pose)] )
-        else:
-            for ref_img, r2t_pose in zip(ref_imgs, r2t_poses):
-                r2t_flows.append( [sf_net(ref_img, r2t_pose)] )
-            for t2r_pose in t2r_poses:
-                t2r_flows.append( [sf_net(tgt_img, t2r_pose)] )
+        r2t_flows = []
+        for ref_img, r2t_pose in zip(ref_imgs, r2t_poses):
+            r2t_flows.append( [sf_net(ref_img, r2t_pose)] )
+
+        t2r_flows = []
+        for t2r_pose in t2r_poses:
+            t2r_flows.append( [sf_net(tgt_img, t2r_pose)] )
 
         '''
             plt.close('all')

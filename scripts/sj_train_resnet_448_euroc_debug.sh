@@ -17,25 +17,21 @@
 
 # --pretrained-sf /data3/seokju/SensorFlow-v2-euroc/checkpoints/211/sfnet_checkpoint_e_ep6.pth.tar \
 
-# --pretrained-sf /data3/seokju/SensorFlow-v2-euroc/checkpoints/resnet_448_euroc/01-31-22:02/sfnet_9_checkpoint.pth.tar \
-
 
 
 ### 200130 ### 
-TRAIN_SET=/data3/seokju/EuRoC_MAV_448/
-CUDA_VISIBLE_DEVICES=5,6,7 python train_euroc.py $TRAIN_SET \
+TRAIN_SET=/seokju/EuRoC_MAV_448/
+CUDA_VISIBLE_DEVICES=5,7 python train_euroc.py $TRAIN_SET \
 --sfnet SFResNet \
 --num-scales 1 \
---max-demi 2 \
--j 4 \
--b 2 -p 1 -s 0.001 -f 0.1 \
+--max-demi 1 \
+-j 0 \
+-b 2 -p 1 -s 0.001 -f 0.5 \
 --epoch-size 1000 --sequence-length 3 \
 --with-mask \
 --with-ssim \
---fwd-flow \
---pretrained-sf /data3/seokju/SensorFlow-v2-euroc/checkpoints/resnet_448_euroc/02-02-03:01/sfnet_checkpoint.pth.tar \
 --pretrained-disp ./pretrained/dispnet_60_checkpoint.pth.tar \
 --rotation-mode euler \
---seed 3 \
+--seed 5 \
 --name resnet_448_euroc_debug \
 --debug-mode

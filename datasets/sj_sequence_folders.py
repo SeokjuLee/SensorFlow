@@ -7,7 +7,6 @@ from matplotlib import pyplot as plt
 import matplotlib.animation as animation
 from matplotlib import style
 from pyquaternion import Quaternion
-import math
 
 import pdb
 
@@ -35,19 +34,17 @@ class SequenceFolder(data.Dataset):
         transform functions must take in a list a images and a numpy array (usually intrinsics matrix)
     """
 
-    def __init__(self, root, seed=None, train=True, max_demi=1, transform=None, target_transform=None, proportion=100):
+    def __init__(self, root, seed=None, train=True, max_demi=1, transform=None, target_transform=None):
         np.random.seed(seed)
         random.seed(seed)
         self.root = Path(root)
         scene_list_path = self.root/'train.txt' if train else self.root/'val.txt'
         # scene_list_path = self.root/'tmp.txt' if train else self.root/'val.txt'
+        # scene_list_path = self.root/'val.txt' if train else self.root/'val.txt'
         self.scenes = [self.root/folder[:-1] for folder in open(scene_list_path)]
         self.transform = transform
         self.train = train
         self.crawl_folders(max_demi)
-        split_index = int(math.floor(len(self.samples)*proportion/100))
-        self.samples = self.samples[:split_index]
-
 
     def crawl_folders(self, max_demi):
         sequence_set = []
@@ -69,6 +66,9 @@ class SequenceFolder(data.Dataset):
                 imgs = sorted(scene.files('*.jpg'))
                 with open(scene/'poses.txt') as f:
                     poses = f.readlines()
+                # with open(scene/'body_poses.txt') as f:
+                #     body_poses = f.readlines()
+
                 if len(imgs) < max(shifts):
                     continue
                 for i in range(max(shifts), len(imgs)-max(shifts)):
