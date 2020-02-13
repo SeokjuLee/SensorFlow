@@ -24,6 +24,7 @@ from inverse_warp import pose_vec2mat
 from imageio import imread
 import matplotlib.animation as animation
 from torch_sparse import coalesce
+from flow_utils import vis_flow
 
 import pdb
 
@@ -76,7 +77,7 @@ parser.add_argument('--log-full', default='progress_log_full.csv',
 parser.add_argument('--with-gt', action='store_true', help='use ground truth for validation. \
                     You need to store it in npy 2D arrays see data/kitti_raw_loader.py for an example')
 parser.add_argument('--sfnet', dest='sfnet', type=str, default='SFResNet',
-                    choices=['SFNet', 'SFResNet'], help='depth network architecture.')
+                    choices=['SFNet', 'SFResNet', 'SFResNet_v2'], help='depth network architecture.')
 parser.add_argument('--num-scales', '--number-of-scales',
                     type=int, help='the number of scales', metavar='W', default=1)
 parser.add_argument('-p', '--photo-loss-weight', type=float,
@@ -96,12 +97,12 @@ parser.add_argument('--debug-mode', action='store_true', help='debug mode or not
 parser.add_argument('--rotation-mode', dest='rotation_mode', type=str, default='quaternion', choices=['quaternion', 'euler', '6D'], help='encoding rotation mode')
 parser.add_argument('--fwd-flow', action='store_true', help='forward-flow mode or not')
 parser.add_argument('--two-way-flow', action='store_true', help='two-way-flow mode or not')
+parser.add_argument('--check-flows', action='store_true', help='check-flows mode or not')
 
 
 best_error = -1
 n_iter = 0
-device = torch.device(
-    "cuda") if torch.cuda.is_available() else torch.device("cpu")
+device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 
 
 def save_animation(file_name, img, img_w, fx, fy, traj, cmap='inferno', gap=1):
@@ -122,6 +123,37 @@ def save_animation(file_name, img, img_w, fx, fy, traj, cmap='inferno', gap=1):
 
     ani = animation.ArtistAnimation(fig, anims, interval=200, blit=False, repeat_delay=20)
     fig.tight_layout(); fig.colorbar(anim1[0], ax=ax1); fig.colorbar(anim2[0], ax=ax2); fig.colorbar(anim3[0], ax=ax3); fig.colorbar(anim4[0], ax=ax4);
+    print("=> Save GIF");
+    ani.save(file_name, writer='imagemagick', fps=10, dpi=100)
+    plt.close('all')
+
+
+def save_animation2(file_name, img, img_iw, img_fw, inv_flows, fwd_flows, traj, cmap='inferno', gap=1):
+    fig = plt.figure(figsize=(16, 8))
+    ax1 = fig.add_subplot(2,3,1)
+    ax2 = fig.add_subplot(2,3,2)
+    ax3 = fig.add_subplot(2,3,3)
+    ax4 = fig.add_subplot(2,3,4)
+    ax5 = fig.add_subplot(2,3,5)
+    ax6 = fig.add_subplot(2,3,6)
+    ax1.grid(linestyle=':', linewidth=0.4)
+    ax2.grid(linestyle=':', linewidth=0.4)
+    ax3.grid(linestyle=':', linewidth=0.4)
+    ax5.grid(linestyle=':', linewidth=0.4)
+    ax6.grid(linestyle=':', linewidth=0.4)
+    anims = []
+    for idx in range(0, traj.shape[0], gap):
+        anim1 = [ax1.imshow(img, animated=True), ax1.annotate("input image", (8,22), bbox={'facecolor': 'white', 'alpha': 0.5})]
+        anim2 = [ax2.imshow(img_iw[idx], animated=True), ax2.annotate("inv warped, (tx,ty,tz) = ({:.2f},{:.2f},{:.2f}) [cm]".format(traj[idx,3],traj[idx,4],traj[idx,5]), (8,22), bbox={'facecolor': 'white', 'alpha': 0.5})]
+        anim3 = [ax3.imshow(img_fw[idx], animated=True), ax3.annotate("fwd warped, (tx,ty,tz) = ({:.2f},{:.2f},{:.2f}) [cm]".format(traj[idx,3],traj[idx,4],traj[idx,5]), (8,22), bbox={'facecolor': 'white', 'alpha': 0.5})]
+        anim5 = [ax5.imshow(vis_flow(inv_flows[idx]), animated=True), ax5.annotate("F_inv, (tx,ty,tz) = ({:.2f},{:.2f},{:.2f}) [cm]".format(traj[idx,3],traj[idx,4],traj[idx,5]), (8,22), bbox={'facecolor': 'white', 'alpha': 0.5})]
+        anim6 = [ax6.imshow(vis_flow(fwd_flows[idx]), animated=True), ax6.annotate("F_fwd, (tx,ty,tz) = ({:.2f},{:.2f},{:.2f}) [cm]".format(traj[idx,3],traj[idx,4],traj[idx,5]), (8,22), bbox={'facecolor': 'white', 'alpha': 0.5})]
+        anims.append(anim1 + anim2 + anim3 + anim5 + anim6)
+
+    ani = animation.ArtistAnimation(fig, anims, interval=200, blit=False, repeat_delay=20)
+    fig.tight_layout(); 
+    # fig.colorbar(anim1[0], ax=ax1); fig.colorbar(anim2[0], ax=ax2); fig.colorbar(anim3[0], ax=ax3); fig.colorbar(anim5[0], ax=ax5); fig.colorbar(anim6[0], ax=ax6);
+    print("=> Save GIF");
     ani.save(file_name, writer='imagemagick', fps=10, dpi=100)
     plt.close('all')
 
@@ -132,7 +164,7 @@ def fwd_warp(im, fwd_flow, upscale=2):
     bb, _, hh, ww = fwd_flow.size()
     i_range = torch.arange(0, hh).view(1, hh, 1).expand(1, hh, ww).type_as(fwd_flow)  # [1, H, W]
     j_range = torch.arange(0, ww).view(1, 1, ww).expand(1, hh, ww).type_as(fwd_flow)  # [1, H, W]
-    pixel_uv = torch.stack((j_range, i_range), dim=1)  # [1, 2, H, W]
+    pixel_uv = torch.stack((j_range, i_range), dim=1)   # [1, 2, H, W]
     flow_uv = pixel_uv + fwd_flow
 
     coo = flow_uv.reshape(2,-1)
@@ -149,9 +181,62 @@ def fwd_warp(im, fwd_flow, upscale=2):
 
     _idx, _val = coalesce(idx, v_im, m=hh+1, n=ww+1, op='mean')
     w_rgb = torch.sparse.FloatTensor(_idx, _val, torch.Size([hh+1,ww+1,3])).to_dense()[:-1,:-1]
-    w_val =  1- (torch.sparse.FloatTensor(_idx, _val, torch.Size([hh+1,ww+1,3])).to_dense()[:-1,:-1]==0).float()
+    w_val = (1- (torch.sparse.FloatTensor(_idx, _val, torch.Size([hh+1,ww+1,3])).to_dense()[:-1,:-1]==0).float()).prod(dim=2)
+    # pdb.set_trace()
 
-    return w_rgb.detach().cpu().numpy() * 0.5 + 0.5, w_val.detach().cpu().numpy()
+    return (w_rgb*w_val.unsqueeze(-1)).detach().cpu().numpy().clip(-1,1) * 0.5 + 0.5, w_val.detach().cpu().numpy()
+
+
+def inv_warp(im, inv_flow):
+    bb, _, hh, ww = inv_flow.size()
+    i_range = torch.arange(0, hh).view(1, hh, 1).expand(1, hh, ww).type_as(inv_flow)  # [1, H, W]
+    j_range = torch.arange(0, ww).view(1, 1, ww).expand(1, hh, ww).type_as(inv_flow)  # [1, H, W]
+    pixel_uv = torch.stack((j_range, i_range), dim=1)   # [1, 2, H, W]
+    flow_uv = (pixel_uv + inv_flow).permute(0,2,3,1)    # [1, H, W, 2]
+
+    flow_uv[:,:,:,0] = flow_uv[:,:,:,0].sub(ww/2).div(ww/2)
+    flow_uv[:,:,:,1] = flow_uv[:,:,:,1].sub(hh/2).div(hh/2)
+
+    if np.array(torch.__version__[:3]).astype(float) >= 1.3:
+        w_rgb = F.grid_sample(im, flow_uv, align_corners=True)
+    else:
+        w_rgb = F.grid_sample(im, flow_uv)
+
+    w_rgb = w_rgb[0].permute(1,2,0)
+    w_val = (flow_uv[0].abs().max(dim=-1)[0] <= 1).float()
+    # pdb.set_trace()
+
+    return (w_rgb*w_val.unsqueeze(-1)).detach().cpu().numpy().clip(-1,1) * 0.5 + 0.5, w_val.detach().cpu().numpy()
+
+
+def flow_warp(img, flow):
+    # img: b x c x h x w
+    # flo: b x 2 x h x w
+    bs, _, gh, gw = img.size()
+    mgrid_np = np.expand_dims(np.mgrid[0:gw,0:gh].transpose(0,2,1).astype(np.float32),0).repeat(bs, axis=0)
+    mgrid = torch.from_numpy(mgrid_np).cuda()
+    grid = mgrid.add(flow).permute(0,2,3,1)
+
+    # grid = mgrid.add(flo12_.div(self.downscale*(2**i))).transpose(1,2).transpose(2,3)
+    #                     # bx2x80x160 -> bx80x2x160 -> bx80x160x2
+    grid[:,:,:,0] = grid[:,:,:,0].sub(gw/2).div(gw/2)
+    grid[:,:,:,1] = grid[:,:,:,1].sub(gh/2).div(gh/2)
+    # pdb.set_trace()
+    
+    if np.array(torch.__version__[:3]).astype(float) >= 1.3:
+        img_w = F.grid_sample(img, grid, align_corners=True)
+    else:
+        img_w = F.grid_sample(img, grid)
+
+    # pdb.set_trace()
+    return img_w
+
+
+def L2_norm(x, dim=1, keepdim=True):
+    curr_offset = 1e-10
+    l2_norm = torch.norm(torch.abs(x) + curr_offset, dim=dim, keepdim=True)
+    return l2_norm
+
 
 
 def main():
@@ -170,22 +255,6 @@ def main():
     # Data loading
     normalize = custom_transforms.Normalize(mean=[0.5, 0.5, 0.5],
                                             std=[0.5, 0.5, 0.5])
-    # train_transform = custom_transforms.Compose([
-    #     custom_transforms.RandomHorizontalFlip(),
-    #     custom_transforms.RandomScaleCrop(),
-    #     custom_transforms.ArrayToTensor(),
-    #     normalize
-    # ])
-    # train_transform = custom_transforms.Compose([
-    #     custom_transforms.RandomHorizontalFlip(),
-    #     custom_transforms.ArrayToTensor(),
-    #     normalize
-    # ])
-    # train_transform = custom_transforms.Compose([
-    #     custom_transforms.RandomScaleCrop(),
-    #     custom_transforms.ArrayToTensor(),
-    #     normalize
-    # ])
     train_transform = custom_transforms.Compose([
         custom_transforms.ArrayToTensor(),
         normalize
@@ -201,25 +270,8 @@ def main():
         train=True,
         max_demi=args.max_demi
     )
-    val_set = SequenceFolder(
-        args.data,
-        transform=valid_transform,
-        seed=args.seed,
-        train=False,
-        max_demi=args.max_demi,
-        proportion=10
-    )
-    print('{} samples found in {} train scenes'.format(
-        len(train_set), len(train_set.scenes)))
-    print('{} samples found in {} valid scenes'.format(
-        len(val_set), len(val_set.scenes)))
-    train_loader = torch.utils.data.DataLoader(
-        train_set, batch_size=args.batch_size, shuffle=False,
-        num_workers=args.workers, pin_memory=True)
-    val_loader = torch.utils.data.DataLoader(
-        val_set, batch_size=args.batch_size, shuffle=False,
-        num_workers=args.workers, pin_memory=True)
-
+    print('{} samples found in {} train scenes'.format(len(train_set), len(train_set.scenes)))
+    train_loader = torch.utils.data.DataLoader(train_set, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True)
     # create model
     print("=> creating model")
 
@@ -234,49 +286,32 @@ def main():
         ch_pred = 2
 
     sf_net = getattr(models, args.sfnet)(dim_motion=dim_motion, ch_pred=ch_pred).to(device)
-    disp_net = getattr(models, 'DispResNet')().to(device)
 
     if args.pretrained_sf:
         print("=> using pre-trained weights for SFNet")
         weights = torch.load(args.pretrained_sf)
         sf_net.load_state_dict(weights['state_dict'], strict=False)
-        # Sf_net.load_state_dict(weights, strict=False)
     else:
         sf_net.init_weights()
 
-    if args.pretrained_disp:
-        print("=> using pre-trained weights for DispNet")
-        weights = torch.load(args.pretrained_disp)
-        disp_net.load_state_dict(weights['state_dict'], strict=True)
-    else:
-        disp_net.init_weights()
-
     cudnn.benchmark = True
     sf_net = torch.nn.DataParallel(sf_net)
-    disp_net = torch.nn.DataParallel(disp_net)
 
-    train_loss = train(args, train_loader, sf_net, disp_net)
-    test_loss  = validate_without_gt(args, val_loader, sf_net, epoch)
+    _demo = demo(args, train_loader, sf_net)
 
 @torch.no_grad()
-def train(args, train_loader, sf_net, disp_net):
-    global n_iter, device
+def demo(args, train_loader, sf_net):
+    global device
     batch_time = AverageMeter()
     data_time = AverageMeter()
-    losses = AverageMeter(precision=4)
-    w1, w2, w3 = args.photo_loss_weight, args.smooth_loss_weight, args.flow_loss_weight
-    # w1, w2 = args.photo_loss_weight, args.smooth_loss_weight
 
     # switch to train mode
     sf_net.eval()
-    disp_net.eval()
 
     end = time.time()
 
     for i, (tgt_img, ref_imgs, intrinsics, intrinsics_inv, r2t_poses, t2r_poses) in enumerate(train_loader):
         # if i > 5: break;
-
-        
 
         # measure data loading time
         data_time.update(time.time() - end)
@@ -290,56 +325,139 @@ def train(args, train_loader, sf_net, disp_net):
         r2t_poses_c = convert_pose(r2t_poses, output_rot_mode=args.rotation_mode)
         t2r_poses_c = convert_pose(t2r_poses, output_rot_mode=args.rotation_mode)
 
+        if args.check_flows:
+            print("=> Start debugging"); pdb.set_trace();
+            continue;
+            
+            bb = 0
+            sq = 0
+            tgt = tgt_img[bb].detach().cpu().numpy().transpose(1,2,0) * 0.5 + 0.5
+            flows_on_tgt = sf_net(tgt_img, t2r_poses_c[sq])        # {t}->{t-1}
+            inv_flow_t2r = flows_on_tgt[:,:2]
+            fwd_flow_r2t = flows_on_tgt[:,2:]
+            inv_flow_arr_t2r = inv_flow_t2r.detach().cpu().numpy()[bb].transpose(1,2,0)
+            fwd_flow_arr_r2t = fwd_flow_r2t.detach().cpu().numpy()[bb].transpose(1,2,0)
 
-        # im = imread('/seokju/EuRoC_MAV_448/MH_01_0/1403636639213555456.jpg').astype(np.float32)
-        # im = imread('/seokju/EuRoC_MAV_448/MH_01_1/1403636757863555584.jpg').astype(np.float32)
-        # im = imread('/seokju/EuRoC_MAV_448/MH_01_1/1403636752863555584.jpg').astype(np.float32)
-        # im = imread('/seokju/EuRoC_MAV_448/V1_01_0/1403715401762142976.jpg').astype(np.float32)
-        im = imread('/seokju/EuRoC_MAV_448/V1_01_0/1403715398812143104.jpg').astype(np.float32)
+            ref = ref_imgs[sq][bb].detach().cpu().numpy().transpose(1,2,0) * 0.5 + 0.5
+            flows_on_ref = sf_net(ref_imgs[sq], r2t_poses_c[sq])   # {t}->{t-1}
+            inv_flow_r2t = flows_on_ref[:,:2]
+            fwd_flow_t2r = flows_on_ref[:,2:]
+            inv_flow_arr_r2t = inv_flow_r2t.detach().cpu().numpy()[bb].transpose(1,2,0)
+            fwd_flow_arr_t2r = fwd_flow_t2r.detach().cpu().numpy()[bb].transpose(1,2,0)
+            
+            """ Occlusion by inverse flows """
+            inv_tr2rt_flow = flow_warp(inv_flow_t2r, inv_flow_r2t)
+            inv_rt2tr_flow = flow_warp(inv_flow_r2t, inv_flow_t2r)
+
+            inv_r2t_flow_diff = torch.abs(inv_tr2rt_flow + inv_flow_r2t)
+            inv_t2r_flow_diff = torch.abs(inv_rt2tr_flow + inv_flow_t2r)
+
+            inv_r2t_consist_bound = torch.max(0.05 * L2_norm(inv_flow_r2t), torch.Tensor([3.0]).cuda())
+            inv_t2r_consist_bound = torch.max(0.05 * L2_norm(inv_flow_t2r), torch.Tensor([3.0]).cuda())
+
+            inv_noc_mask_ref = (L2_norm(inv_t2r_flow_diff) < inv_t2r_consist_bound).type(torch.FloatTensor).cuda()
+            inv_noc_mask_tgt = (L2_norm(inv_r2t_flow_diff) < inv_r2t_consist_bound).type(torch.FloatTensor).cuda()
+
+            inv_noc_mask_ref_arr = inv_noc_mask_ref[bb,0].detach().cpu().numpy()
+            inv_noc_mask_tgt_arr = inv_noc_mask_tgt[bb,0].detach().cpu().numpy()
+
+            """ Occlusion by forward flows """
+            fwd_tr2rt_flow = flow_warp(fwd_flow_t2r, fwd_flow_r2t)
+            fwd_rt2tr_flow = flow_warp(fwd_flow_r2t, fwd_flow_t2r)
+
+            fwd_r2t_flow_diff = torch.abs(fwd_tr2rt_flow + fwd_flow_r2t)
+            fwd_t2r_flow_diff = torch.abs(fwd_rt2tr_flow + fwd_flow_t2r)
+
+            fwd_r2t_consist_bound = torch.max(0.05 * L2_norm(fwd_flow_r2t), torch.Tensor([3.0]).cuda())
+            fwd_t2r_consist_bound = torch.max(0.05 * L2_norm(fwd_flow_t2r), torch.Tensor([3.0]).cuda())
+
+            fwd_noc_mask_ref = (L2_norm(fwd_t2r_flow_diff) < fwd_t2r_consist_bound).type(torch.FloatTensor).cuda()
+            fwd_noc_mask_tgt = (L2_norm(fwd_r2t_flow_diff) < fwd_r2t_consist_bound).type(torch.FloatTensor).cuda()
+
+            fwd_noc_mask_ref_arr = fwd_noc_mask_ref[bb,0].detach().cpu().numpy()
+            fwd_noc_mask_tgt_arr = fwd_noc_mask_tgt[bb,0].detach().cpu().numpy()
+
+
+            plt.close('all');
+            fig = plt.figure(1, figsize=(20, 13))
+            ea1 = 4; ea2 = 4; ii = 1;
+            fig.add_subplot(ea1,ea2,ii); ii += 1;
+            plt.imshow(inv_flow_arr_t2r[:,:,0]); plt.colorbar(); plt.text(0, 20, "(tgt→) inv_flow_arr_t2r[0]", bbox={'facecolor': 'yellow', 'alpha': 0.5}); plt.grid(linestyle=':', linewidth=0.4);
+            fig.add_subplot(ea1,ea2,ii); ii += 1;
+            plt.imshow(inv_flow_arr_t2r[:,:,1]); plt.colorbar(); plt.text(0, 20, "(tgt→) inv_flow_arr_t2r[1]", bbox={'facecolor': 'yellow', 'alpha': 0.5}); plt.grid(linestyle=':', linewidth=0.4);
+            fig.add_subplot(ea1,ea2,ii); ii += 1;
+            plt.imshow(fwd_flow_arr_r2t[:,:,0]); plt.colorbar(); plt.text(0, 20, "(tgt→) fwd_flow_arr_r2t[0]", bbox={'facecolor': 'yellow', 'alpha': 0.5}); plt.grid(linestyle=':', linewidth=0.4);
+            fig.add_subplot(ea1,ea2,ii); ii += 1;
+            plt.imshow(fwd_flow_arr_r2t[:,:,1]); plt.colorbar(); plt.text(0, 20, "(tgt→) fwd_flow_arr_r2t[1]", bbox={'facecolor': 'yellow', 'alpha': 0.5}); plt.grid(linestyle=':', linewidth=0.4);
+            fig.add_subplot(ea1,ea2,ii); ii += 1;
+            plt.imshow(inv_flow_arr_r2t[:,:,0]); plt.colorbar(); plt.text(0, 20, "(ref→) inv_flow_arr_r2t[0]", bbox={'facecolor': 'yellow', 'alpha': 0.5}); plt.grid(linestyle=':', linewidth=0.4);
+            fig.add_subplot(ea1,ea2,ii); ii += 1;
+            plt.imshow(inv_flow_arr_r2t[:,:,1]); plt.colorbar(); plt.text(0, 20, "(ref→) inv_flow_arr_r2t[1]", bbox={'facecolor': 'yellow', 'alpha': 0.5}); plt.grid(linestyle=':', linewidth=0.4);
+            fig.add_subplot(ea1,ea2,ii); ii += 1;
+            plt.imshow(fwd_flow_arr_t2r[:,:,0]); plt.colorbar(); plt.text(0, 20, "(ref→) fwd_flow_arr_t2r[0]", bbox={'facecolor': 'yellow', 'alpha': 0.5}); plt.grid(linestyle=':', linewidth=0.4);
+            fig.add_subplot(ea1,ea2,ii); ii += 1;
+            plt.imshow(fwd_flow_arr_t2r[:,:,1]); plt.colorbar(); plt.text(0, 20, "(ref→) fwd_flow_arr_t2r[1]", bbox={'facecolor': 'yellow', 'alpha': 0.5}); plt.grid(linestyle=':', linewidth=0.4);
+            fig.add_subplot(ea1,ea2,ii); ii += 1;
+            plt.imshow(inv_noc_mask_tgt_arr); plt.colorbar(); plt.text(0, 20, "inv_noc_mask_tgt_arr", bbox={'facecolor': 'yellow', 'alpha': 0.5}); plt.grid(linestyle=':', linewidth=0.4);
+            fig.add_subplot(ea1,ea2,ii); ii += 1;
+            plt.imshow(inv_noc_mask_ref_arr); plt.colorbar(); plt.text(0, 20, "inv_noc_mask_ref_arr", bbox={'facecolor': 'yellow', 'alpha': 0.5}); plt.grid(linestyle=':', linewidth=0.4);
+            fig.add_subplot(ea1,ea2,ii); ii += 1;
+            plt.imshow(fwd_noc_mask_tgt_arr); plt.colorbar(); plt.text(0, 20, "fwd_noc_mask_tgt_arr", bbox={'facecolor': 'yellow', 'alpha': 0.5}); plt.grid(linestyle=':', linewidth=0.4);
+            fig.add_subplot(ea1,ea2,ii); ii += 1;
+            plt.imshow(fwd_noc_mask_ref_arr); plt.colorbar(); plt.text(0, 20, "fwd_noc_mask_ref_arr", bbox={'facecolor': 'yellow', 'alpha': 0.5}); plt.grid(linestyle=':', linewidth=0.4);
+            fig.add_subplot(ea1,ea2,ii); ii += 1;
+            plt.imshow(tgt); plt.colorbar(); plt.text(0, 20, "tgt", bbox={'facecolor': 'yellow', 'alpha': 0.5}); plt.grid(linestyle=':', linewidth=0.4);
+            fig.add_subplot(ea1,ea2,ii); ii += 1;
+            plt.imshow(ref); plt.colorbar(); plt.text(0, 20, "ref", bbox={'facecolor': 'yellow', 'alpha': 0.5}); plt.grid(linestyle=':', linewidth=0.4);
+            plt.tight_layout(); plt.ion(); plt.show();
+            
+
+            # img_iw = inv_warp(tgt_img, inv_flow_t2r)[bb]
+            # img_fw = inv_warp(tgt_img, fwd_flow_r2t)[bb]
+            # f_inv_t2r = vis_flow(inv_flow_arr_t2r)
+            # f_fwd_t2r = vis_flow(fwd_flow_arr_t2r)
+
+
+        # im = imread('/data3/seokju/EuRoC_MAV_448/MH_01_0/1403636639213555456.jpg').astype(np.float32)
+        im = imread('/data3/seokju/EuRoC_MAV_448/MH_01_1/1403636757863555584.jpg').astype(np.float32)
+        # im = imread('/data3/seokju/EuRoC_MAV_448/MH_01_1/1403636752863555584.jpg').astype(np.float32)
+        # im = imread('/data3/seokju/EuRoC_MAV_448/V1_01_0/1403715401762142976.jpg').astype(np.float32)
+        # im = imread('/data3/seokju/EuRoC_MAV_448/V1_01_0/1403715398812143104.jpg').astype(np.float32)
         im = np.transpose(im, (2, 0, 1))
         im = torch.from_numpy(im).float()/255
         im = im.sub(0.5).div(0.5).unsqueeze(0).to(device)
 
         img = im[0].detach().cpu().numpy().transpose(1,2,0) * 0.5 + 0.5
 
-        # txs = np.arange(0, 0.1, 0.01).tolist() + np.arange(0.1, 0, -0.01).tolist() 
-
-        # tt = np.pi * np.arange(0, 2, 0.05)
-        # txs = 0.3 * np.sin(tt)
-        # tys = 0.3 * np.sin(tt)
-        # tzs = 0.3 * np.sin(tt)
-        # # traj = np.array([[0,0,0,tx,0,0] for tx in txs]).astype(np.float32)
-        # # traj = np.array([[0,0,0,0,ty,0] for ty in tys]).astype(np.float32)
-        # # traj = np.array([[0,0,0,0,0,tz] for tz in tzs]).astype(np.float32)
-        # # traj = np.array([[0,0,0,tx,ty,0] for tx, ty in zip(txs,tys)]).astype(np.float32)
-        # traj = np.array([[0,0,0,0,0,tz] for tz in tzs] + [[0,0,0,tx,0,0] for tx in txs]).astype(np.float32)
-
         """Generate virtual trajectory via 3D parametric curve"""
-        traj = []
-        # for th in np.linspace(0., 2 * np.pi, 60):
-        #     tx = 0.2 * np.sin(2*th) * np.cos(3*th)
-        #     ty = 0.2 * np.sin(2*th) * np.sin(3*th)
-        #     tz = 0.2 * (-np.cos(th) + 1)
-        #     traj.append([0, 0, 0, tx, ty, tz])
-        # for th in np.linspace(0., 2 * np.pi, 40):
-        #     tx = 0.2 * np.sin(1*th) * np.cos(2*th)
-        #     ty = 0.2 * np.sin(1*th) * np.sin(2*th)
-        #     tz = 0.2 * (-np.cos(th) + 1)
-        #     traj.append([0, 0, 0, tx, ty, tz])
-        for th in np.linspace(0., 1 * np.pi, 30):
-            tx = 0.15 * np.sin(1*th) * np.cos(4*th)
-            ty = 0.15 * np.sin(1*th) * np.sin(4*th)
-            tz = 0.25 * (-np.cos(th) + 1)
-            traj.append([0, 0, 0, tx, ty, tz])
-        for th in np.linspace(1/2 * np.pi, 2 * np.pi, 20):
-            tz = 0.5 * np.sin(th)
-            traj.append([0, 0, 0, 0, 0, tz])
-        traj = np.array(traj).astype(np.float32)
-        # pdb.set_trace()
 
-        fwd_fx, fwd_fy = [], []
+        tt = np.pi * np.arange(0, 2, 0.05)
+        txs = 0.3 * np.sin(tt)
+        tys = 0.3 * np.sin(tt)
+        tzs = 0.3 * np.sin(tt)
+        # traj = np.array([[0,0,0,tx,0,0] for tx in txs]).astype(np.float32)
+        # traj = np.array([[0,0,0,0,ty,0] for ty in tys]).astype(np.float32)
+        # traj = np.array([[0,0,0,0,0,tz] for tz in tzs]).astype(np.float32)
+        # traj = np.array([[0,0,0,tx,ty,0] for tx, ty in zip(txs,tys)]).astype(np.float32)
+        # traj = np.array([[0,0,0,0,0,tz] for tz in tzs] + [[0,0,0,tx,0,0] for tx in txs]).astype(np.float32)
+        traj = np.array([[0,0,0,tx,0,0] for tx in txs] + [[0,0,0,0,ty,0] for ty in tys]).astype(np.float32)
+        
+        # traj = []
+        # for th in np.linspace(0., 1 * np.pi, 30):
+        #     tx = 0.15 * np.sin(1*th) * np.cos(4*th)
+        #     ty = 0.15 * np.sin(1*th) * np.sin(4*th)
+        #     tz = 0.25 * (-np.cos(th) + 1)
+        #     traj.append([0, 0, 0, tx, ty, tz])
+        # for th in np.linspace(1/2 * np.pi, 2 * np.pi, 20):
+        #     tz = 0.5 * np.sin(th)
+        #     traj.append([0, 0, 0, 0, 0, tz])
+        # traj = np.array(traj).astype(np.float32)
+
+
         inv_fx, inv_fy = [], []
+        fwd_fx, fwd_fy = [], []
         img_fw, img_iw = [], []
+        inv_flows, fwd_flows = [], []
 
         if args.fwd_flow:
             for pose in traj:
@@ -362,284 +480,17 @@ def train(args, train_loader, sf_net, disp_net):
                 inv_fy.append( inv_flow_arr[0,1] )
                 fwd_fx.append( fwd_flow_arr[0,0] )
                 fwd_fy.append( fwd_flow_arr[0,1] )
-                img_iw.append( fwd_warp(im, fwd_flow)[0] )
+                img_iw.append( inv_warp(im, inv_flow)[0] )
                 img_fw.append( fwd_warp(im, fwd_flow)[0] )
-            save_animation('./temp_fwd.gif', img, img_fw, inv_fx, inv_fy, traj, cmap='inferno', gap=1)
-            save_animation('./temp_inv.gif', img, img_iw, fwd_fx, fwd_fy, traj, cmap='inferno', gap=1)
-
-
-        pdb.set_trace()
-
-        traj = []
-        for th in np.linspace(0., 2 * np.pi, 80+1):
-            tx = np.sin(2*th) * np.cos(3*th)
-            ty = np.sin(2*th) * np.sin(3*th)
-            tz = np.cos(th) + 1
-            traj.append([0, 0, 0, tx, ty, tz])
-        traj = np.array(traj).astype(np.float32)
-
-
-        save_animation('./temp.gif', img, fwd_fx, fwd_fy, traj, cmap='inferno', gap=1)
-
-        bb, _, hh, ww = fwd_flow.size()
-        i_range = torch.arange(0, hh).view(1, hh, 1).expand(1, hh, ww).type_as(fwd_flow)  # [1, H, W]
-        j_range = torch.arange(0, ww).view(1, 1, ww).expand(1, hh, ww).type_as(fwd_flow)  # [1, H, W]
-        pixel_uv = torch.stack((j_range, i_range), dim=1)  # [1, 2, H, W]
-        flow_uv = pixel_uv + fwd_flow
-
-        coo = flow_uv.reshape(2,-1)
-        v_im = im.reshape(3,-1).permute(1,0)
-        idx = coo.long()[[1,0]]
-        idx[0][idx[0]<0] = hh
-        idx[0][idx[0]>hh-1] = hh
-        idx[1][idx[1]<0] = ww
-        idx[1][idx[1]>ww-1] = ww
-
-        _idx, _val = coalesce(idx, v_im, m=hh+1, n=ww+1, op='mean')
-        w_rgb = torch.sparse.FloatTensor(_idx, _val, torch.Size([hh+1,ww+1,3])).to_dense()[:-1,:-1]
-        w_val =  1- (torch.sparse.FloatTensor(_idx, _val, torch.Size([hh+1,ww+1,3])).to_dense()[:-1,:-1]==0).float()
-
-        plt.close('all')
-        aaa = w_rgb.detach().cpu().numpy() * 0.5 + 0.5
-        bbb = w_val.detach().cpu().numpy()
-        plt.figure(1); plt.imshow(aaa), plt.colorbar(), plt.ion(), plt.show()
-        plt.figure(2); plt.imshow(bbb), plt.colorbar(), plt.ion(), plt.show()
-
-
-        # plt.close('all')
-        # fig = plt.figure(1, figsize=(22, 4))
-        # ax1 = fig.add_subplot(1,4,1)
-        # ax2 = fig.add_subplot(1,4,2)
-        # ax3 = fig.add_subplot(1,4,3)
-        # fx_max, fx_min = np.array(fx).max(), np.array(fx).min()
-        # fy_max, fy_min = np.array(fy).max(), np.array(fy).min()
-        # anims = []
-        # for idx in range(0, traj.shape[0], 1):
-        #     anim1 = [ax1.imshow(fx[idx], animated=True, vmax=fx_max, vmin=fx_min), ax1.annotate("tx: {:.4f}".format(traj[idx,3]), (8,26), bbox={'facecolor': 'silver', 'alpha': 0.5})]
-        #     anim2 = [ax2.imshow(fy[idx], animated=True, vmax=fy_max, vmin=fy_min), ax2.annotate("ty: {:.4f}".format(traj[idx,4]), (8,26), bbox={'facecolor': 'silver', 'alpha': 0.5})]
-        #     anim3 = [ax3.imshow(img, animated=True), ax3.annotate("input image", (8,26), bbox={'facecolor': 'silver', 'alpha': 0.5})]
-        #     anims.append(anim1 + anim2 + anim3)
-
-        # ani = animation.ArtistAnimation(fig, anims, interval=200, blit=False, repeat_delay=20)
-        # fig.tight_layout(); fig.colorbar(anim1[0], ax=ax1); fig.colorbar(anim2[0], ax=ax2); fig.colorbar(anim3[0], ax=ax3); plt.ion(); plt.show();
-        # ani.save('./exAnimation.gif', writer='imagemagick', fps=10, dpi=100)
-
-
-
-        # fig = plt.figure(1)
-        # anims = []
-        # vmax = np.array(fx).max()
-        # vmin = np.array(fx).min()
-        # for idx in range(0, len(fx), 1): anims.append([plt.imshow(fx[idx], animated=True, vmax=vmax, vmin=vmin)])
-        # ani = animation.ArtistAnimation(fig, anims, interval=200, blit=False, repeat_delay=20)
-        # fig.tight_layout(), plt.colorbar(), plt.ion(), plt.show()
-
-        # fig = plt.figure(2)
-        # anims = []
-        # vmax = np.array(fy).max()
-        # vmin = np.array(fy).min()
-        # for idx in range(0, len(fy), 1): anims.append([plt.imshow(fy[idx], animated=True, vmax=vmax, vmin=vmin)])
-        # ani = animation.ArtistAnimation(fig, anims, interval=200, blit=False, repeat_delay=20)
-        # fig.tight_layout(), plt.colorbar(), plt.ion(), plt.show()
-
+                inv_flows.append( inv_flow_arr[0].transpose(1,2,0) )
+                fwd_flows.append( fwd_flow_arr[0].transpose(1,2,0) )
+            # save_animation('./temp_inv.gif', img, img_iw, inv_fx, inv_fy, traj, cmap='inferno', gap=1)
+            # save_animation('./temp_fwd.gif', img, img_fw, fwd_fx, fwd_fy, traj, cmap='inferno', gap=1)
+            save_animation2('./anim2.gif', img, img_iw, img_fw, inv_flows, fwd_flows, traj, cmap='inferno', gap=1)
 
         pdb.set_trace()
-        '''
-            anim.save('superpositionWaves.mp4', writer = 'ffmpeg', fps = 1, dpi=400,extra_args=['-vcodec', 'libx264'])
 
-            plt.close('all')
-            bb = 0
-            aaa = tgt_img[bb].detach().cpu().numpy().transpose(1,2,0) * 0.5 + 0.5
-            bbb = ref_imgs[0][bb].detach().cpu().numpy().transpose(1,2,0) * 0.5 + 0.5
-            ccc = ref_imgs[1][bb].detach().cpu().numpy().transpose(1,2,0) * 0.5 + 0.5
-            plt.figure(1); plt.imshow(aaa); plt.colorbar(); plt.tight_layout(); plt.ion(); plt.show();
-            plt.figure(2); plt.imshow(bbb); plt.colorbar(); plt.tight_layout(); plt.ion(); plt.show();
-            plt.figure(3); plt.imshow(ccc); plt.colorbar(); plt.tight_layout(); plt.ion(); plt.show();
-
-            viz_filter(sf_net)
-
-            aaa = sf_net.module.conv1[0].weight
-            bbb = sf_net.module.conv1[2].weight
-            ccc = sf_net.module.conv5[0].conv1.weight
-            ddd = sf_net.module.conv7[0].conv2.weight
-            eee = sf_net.module.conv7[2].conv2.weight
-            p (aaa.abs()<0.001).sum()/(aaa.abs()<9999).sum().float()
-            p (bbb.abs()<0.001).sum()/(bbb.abs()<9999).sum().float()
-            p (ccc.abs()<0.001).sum()/(ccc.abs()<9999).sum().float()
-            p (ddd.abs()<0.001).sum()/(ddd.abs()<9999).sum().float()
-            p (eee.abs()<0.001).sum()/(eee.abs()<9999).sum().float()
-
-        '''
-
-        
-
-        # compute output
-        tgt_depth = 1/disp_net(tgt_img).detach()
-        ref_depths = [1/disp_net(ref_img).detach() for ref_img in ref_imgs]
-        # pdb.set_trace()
-
-        """About two-way-flow"""
-        '''
-            Input: single frame -> 4ch output inv/fwd flows
-            
-            [1st two xy-channels] inv_r2t_flows: {(I_ref, P_t2r) input -> F_r2t} => {(I_ref, P_r2t) input -> F_r2t}
-            [2nd two xy-channels] fwd_t2r_flows: {(I_ref, P_r2t) input -> F_t2r}
-            
-            [1st two xy-channels] inv_t2r_flows: {(I_tgt, P_r2t) input -> F_t2r} => {(I_tgt, P_t2r) input -> F_t2r}
-            [2nd two xy-channels] fwd_r2t_flows: {(I_tgt, P_t2r) input -> F_r2t}
-        
-            compute_two_way_flow(sf_net, tgt_img, ref_imgs, r2t_poses, t2r_poses)
-        '''
-        if args.two_way_flow:
-            inv_r2t_flows, fwd_t2r_flows, inv_t2r_flows, fwd_r2t_flows = compute_two_way_flow(sf_net, tgt_img, ref_imgs, r2t_poses_c, t2r_poses_c)
-        elif args.fwd_flow:
-            r2t_flows, t2r_flows = compute_fwd_flow(sf_net, tgt_img, ref_imgs, r2t_poses_c, t2r_poses_c)
-        else:
-            r2t_flows, t2r_flows = compute_inv_flow(sf_net, tgt_img, ref_imgs, r2t_poses_c, t2r_poses_c)
-
-        # poses, poses_inv = compute_pose_with_inv(pose_net, tgt_img, ref_imgs)
-        pdb.set_trace()
-        '''
-            ### dpoint ###
-
-            plt.close('all')
-            bb = 1
-            aaa = tgt_img[bb].detach().cpu().numpy().transpose(1,2,0) * 0.5 + 0.5
-            bbb = ref_imgs[0][bb].detach().cpu().numpy().transpose(1,2,0) * 0.5 + 0.5
-            ccc = r2t_flows[0][0][bb,0].detach().cpu().numpy()
-            plt.figure(1); plt.imshow(aaa); plt.colorbar(); plt.tight_layout(); plt.ion(); plt.show();
-            plt.figure(2); plt.imshow(bbb); plt.colorbar(); plt.tight_layout(); plt.ion(); plt.show();
-            plt.figure(3); plt.imshow(ccc, cmap='plasma'); plt.colorbar(); plt.tight_layout(); plt.ion(); plt.show();
-
-            
-            plt.close('all')
-            bb = 1
-            aaa = tgt_img[bb].detach().cpu().numpy().transpose(1,2,0) * 0.5 + 0.5
-            bbb = tgt_depth[bb,0].detach().cpu().numpy()
-            plt.figure(1); plt.imshow(aaa); plt.colorbar(); plt.tight_layout(); plt.ion(); plt.show();
-            plt.figure(2); plt.imshow(bbb, cmap='plasma'); plt.colorbar(); plt.tight_layout(); plt.ion(); plt.show();
-            
-            
-            plt.figure(2); plt.imshow(bbb, cmap='plasma', vmax=0.5); plt.colorbar(); plt.tight_layout(); plt.ion(); plt.show();
-            aaa = pose_vec2mat(poses[0], rotation_mode='euler')
-        '''
-        if args.two_way_flow:
-            loss_1 = compute_photo_loss(tgt_img, ref_imgs, inv_r2t_flows, inv_t2r_flows, args)
-            loss_1 += compute_photo_loss(tgt_img, ref_imgs, fwd_r2t_flows, fwd_t2r_flows, args)
-            loss_2 = compute_flow_smooth_loss(inv_r2t_flows, tgt_img, inv_t2r_flows, ref_imgs)
-            loss_2 += compute_flow_smooth_loss(fwd_r2t_flows, tgt_img, fwd_t2r_flows, ref_imgs)
-            loss_3 = compute_rigid_flow_loss(tgt_img, ref_imgs, inv_r2t_flows, inv_t2r_flows, tgt_depth, ref_depths, r2t_poses, t2r_poses, intrinsics, args)
-            loss_3 += compute_rigid_flow_loss(tgt_img, ref_imgs, fwd_r2t_flows, fwd_t2r_flows, tgt_depth, ref_depths, r2t_poses, t2r_poses, intrinsics, args)
-        else:
-            loss_1 = compute_photo_loss(tgt_img, ref_imgs, r2t_flows, t2r_flows, args)
-            loss_2 = compute_flow_smooth_loss(r2t_flows, tgt_img, t2r_flows, ref_imgs)
-            loss_3 = compute_rigid_flow_loss(tgt_img, ref_imgs, r2t_flows, t2r_flows, tgt_depth, ref_depths, r2t_poses, t2r_poses, intrinsics, args)
-
-        # loss = w1*loss_1 + w2*loss_2
-        loss = w1*loss_1 + w2*loss_2 + w3*loss_3
-
-        # record loss and EPE
-        losses.update(loss.item(), args.batch_size)
-
-        # measure elapsed time
-        batch_time.update(time.time() - end)
-        end = time.time()
-
-        with open(args.save_path/args.log_full, 'a') as csvfile:
-            writer = csv.writer(csvfile, delimiter='\t')
-            writer.writerow([loss_1.item(), loss_2.item(), loss_3.item(), loss.item()])
-            # writer.writerow([loss_1.item(), loss_2.item(), loss.item()])
-
-    return losses.avg[0]
-
-
-
-@torch.no_grad()
-def validate_without_gt(args, val_loader, sf_net):
-    global device
-    batch_time = AverageMeter()
-    # losses = AverageMeter(i=4, precision=4)
-    losses = AverageMeter(i=3, precision=4)
-
-    # w1, w2, w3 = args.photo_loss_weight, args.smooth_loss_weight, args.flow_loss_weight
-    w1, w2 = args.photo_loss_weight, args.smooth_loss_weight
-
-    # switch to evaluate mode
-    sf_net.eval()
-
-    end = time.time()
-
-    for i, (tgt_img, ref_imgs, intrinsics, intrinsics_inv, r2t_poses, t2r_poses) in enumerate(val_loader):
-        # if i > 5: break;
-        
-        tgt_img = tgt_img.to(device)
-        ref_imgs = [img.to(device) for img in ref_imgs]
-        intrinsics = intrinsics.to(device)
-        intrinsics_inv = intrinsics_inv.to(device)
-        r2t_poses = [r2t_pose.to(device) for r2t_pose in r2t_poses]
-        t2r_poses = [t2r_pose.to(device) for t2r_pose in t2r_poses]
-
-        r2t_poses = convert_pose(r2t_poses, output_rot_mode=args.rotation_mode)
-        t2r_poses = convert_pose(t2r_poses, output_rot_mode=args.rotation_mode)
-
-        """ compute output """
-        if args.two_way_flow:
-            inv_r2t_flows, fwd_t2r_flows = [], []
-            inv_t2r_flows, fwd_r2t_flows = [], []
-            for ref_img, r2t_pose in zip(ref_imgs, r2t_poses):
-                outputs = [sf_net(ref_img, r2t_pose)]
-                inv_flows = [output[:,:2] for output in outputs]
-                fwd_flows = [output[:,2:] for output in outputs]
-                inv_r2t_flows.append( inv_flows )
-                fwd_t2r_flows.append( fwd_flows )
-            for t2r_pose in t2r_poses:
-                outputs = [sf_net(tgt_img, t2r_pose)]
-                inv_flows = [output[:,:2] for output in outputs]
-                fwd_flows = [output[:,2:] for output in outputs]
-                inv_t2r_flows.append( inv_flows )
-                fwd_r2t_flows.append( fwd_flows )
-        elif args.fwd_flow:
-            r2t_flows, t2r_flows = [], []
-            for t2r_pose in t2r_poses:
-                r2t_flows.append( [sf_net(tgt_img, t2r_pose)] )
-            for ref_img, r2t_pose in zip(ref_imgs, r2t_poses):
-                t2r_flows.append( [sf_net(ref_img, r2t_pose)] )
-        else:
-            r2t_flows, t2r_flows = [], []
-            for ref_img, r2t_pose in zip(ref_imgs, r2t_poses):
-                r2t_flows.append( [sf_net(ref_img, r2t_pose)] )
-            for t2r_pose in t2r_poses:
-                t2r_flows.append( [sf_net(tgt_img, t2r_pose)] )
-
-        '''
-            plt.close('all')
-            bb = 1
-            aaa = tgt_img[bb].detach().cpu().numpy().transpose(1,2,0) * 0.5 + 0.5
-            bbb = 1/tgt_depth[0][bb,0].detach().cpu().numpy()
-            plt.figure(1); plt.imshow(aaa); plt.colorbar(); plt.tight_layout(); plt.ion(); plt.show();
-            plt.figure(2); plt.imshow(bbb, cmap='plasma'); plt.colorbar(); plt.tight_layout(); plt.ion(); plt.show();
-
-        '''
-        if args.two_way_flow:
-            loss_1 = compute_photo_loss(tgt_img, ref_imgs, inv_r2t_flows, inv_t2r_flows, args)
-            loss_1 += compute_photo_loss(tgt_img, ref_imgs, fwd_r2t_flows, fwd_t2r_flows, args)
-            loss_2 = compute_flow_smooth_loss(inv_r2t_flows, tgt_img, inv_t2r_flows, ref_imgs)
-            loss_2 += compute_flow_smooth_loss(fwd_r2t_flows, tgt_img, fwd_t2r_flows, ref_imgs)
-        else:
-            loss_1 = compute_photo_loss(tgt_img, ref_imgs, r2t_flows, t2r_flows, args)
-            loss_2 = compute_flow_smooth_loss(r2t_flows, tgt_img, t2r_flows, ref_imgs)
-
-        loss_1 = loss_1.item()
-        loss_2 = loss_2.item()
-
-        loss = w1*loss_1 + w2*loss_2
-        losses.update([loss, loss_1, loss_2])
-
-        # measure elapsed time
-        batch_time.update(time.time() - end)
-        end = time.time()
-        
-    return losses.avg
+    return 0
 
 
 
