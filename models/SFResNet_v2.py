@@ -261,6 +261,7 @@ class SFResNet_v2(nn.Module):
         flow3 = torch.cat((flow3_inv, flow3_fwd), 1)    # torch.Size([2, 4, 112, 176])
         flow2 = torch.cat((flow2_inv, flow2_fwd), 1)    # torch.Size([2, 4, 224, 352])
         flow1 = torch.cat((flow1_inv, flow1_fwd), 1)    # torch.Size([2, 4, 448, 704])
+        # pdb.set_trace()
 
         if self.training:
             return flow1, flow2, flow3, flow4

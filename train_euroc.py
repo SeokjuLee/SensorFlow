@@ -6,6 +6,7 @@ import datetime
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 import torch.backends.cudnn as cudnn
 import torch.optim
 import torch.utils.data
@@ -13,12 +14,14 @@ import custom_transforms
 
 import models
 from utils import save_checkpoint
-from loss_functions import compute_photo_loss, compute_flow_smooth_loss, compute_rigid_flow_loss, compute_errors
+from loss_functions import compute_photo_loss, compute_flow_smooth_loss, compute_rigid_flow_loss, compute_flow_consistency_loss, compute_occ_guide_loss
+from loss_functions import inv_warp, fwd_warp, compute_errors
 from logger import TermLogger, AverageMeter
 from tensorboardX import SummaryWriter
 
 from matplotlib import pyplot as plt
 from inverse_warp import pose_vec2mat
+# from viz_filter import viz_filter
 import pdb
 
 parser = argparse.ArgumentParser(description='Unsupervised Scale-consistent Depth and Ego-motion Learning from Monocular Video (KITTI and CityScapes)',
@@ -70,7 +73,7 @@ parser.add_argument('--log-full', default='progress_log_full.csv',
 parser.add_argument('--with-gt', action='store_true', help='use ground truth for validation. \
                     You need to store it in npy 2D arrays see data/kitti_raw_loader.py for an example')
 parser.add_argument('--sfnet', dest='sfnet', type=str, default='SFResNet',
-                    choices=['SFNet', 'SFResNet'], help='depth network architecture.')
+                    choices=['SFNet', 'SFResNet', 'SFResNet_v2', 'SFResNet50'], help='depth network architecture.')
 parser.add_argument('--num-scales', '--number-of-scales',
                     type=int, help='the number of scales', metavar='W', default=1)
 parser.add_argument('-p', '--photo-loss-weight', type=float,
@@ -79,16 +82,19 @@ parser.add_argument('-s', '--smooth-loss-weight', type=float,
                     help='weight for flow smoothness loss', metavar='W', default=0.1)
 parser.add_argument('-f', '--flow-loss-weight', type=float,
                     help='weight for flow loss', metavar='W', default=0.1)
-parser.add_argument('-c', '--geometry-consistency-weight', type=float,
-                    help='weight for depth consistency loss', metavar='W', default=0.5)
+parser.add_argument('-c', '--flow-consistency-weight', type=float,
+                    help='weight for flow consistency loss', metavar='W', default=0.1)
+parser.add_argument('-o', '--occlusion-guide-weight', type=float,
+                    help='weight for occlusion guide loss', metavar='W', default=0.1)
 parser.add_argument('--with-ssim', action='store_true', help='use ssim loss',)
-parser.add_argument('--with-mask', action='store_true',
-                    help='use the the mask for handling moving objects and occlusions')
+parser.add_argument('--with-mask', action='store_true', help='use the mask for handling moving objects and occlusions')
 parser.add_argument('--name', dest='name', type=str, required=True,
                     help='name of the experiment, checkpoints are stored in checpoints/name')
 parser.add_argument('--debug-mode', action='store_true', help='debug mode or not')
 parser.add_argument('--rotation-mode', dest='rotation_mode', type=str, default='quaternion', choices=['quaternion', 'euler', '6D'], help='encoding rotation mode')
 parser.add_argument('--fwd-flow', action='store_true', help='forward-flow mode or not')
+parser.add_argument('--two-way-flow', action='store_true', help='two-way-flow mode or not')
+parser.add_argument('--with-depth', action='store_true', help='use the depth knowledge')
 
 
 best_error = -1
@@ -178,30 +184,49 @@ def main():
     print("=> creating model")
 
     if args.rotation_mode == 'quaternion':
-        sf_net = getattr(models, args.sfnet)(dim_motion=7).to(device)
+        dim_motion = 7
     elif args.rotation_mode in ['euler', '6D']:
-        sf_net = getattr(models, args.sfnet)(dim_motion=6).to(device)
+        dim_motion = 6
 
-    disp_net = getattr(models, 'DispResNet')().to(device)
+    if args.two_way_flow:
+        ch_pred = 4
+    else:
+        ch_pred = 2
+
+    sf_net = getattr(models, args.sfnet)(alpha=20, dim_motion=dim_motion).to(device)
+    if args.with_depth:
+        disp_net = getattr(models, 'DispResNet')().to(device)
+    else:
+        disp_net = None
 
     if args.pretrained_sf:
         print("=> using pre-trained weights for SFNet")
         weights = torch.load(args.pretrained_sf)
         sf_net.load_state_dict(weights['state_dict'], strict=False)
         # Sf_net.load_state_dict(weights, strict=False)
+    # if args.pretrained_sf:
+    #     print("=> using pre-trained weights for SFNet")
+    #     weights = torch.load(args.pretrained_sf)
+    #     model_dict = ['conv1.0.weight', 'conv1.0.bias', 'conv1.2.weight', 'conv1.2.bias', 'conv2.0.conv1.weight', 'conv2.0.conv2.weight', 'conv2.0.downsample.0.weight', 'conv2.0.downsample.1.weight', 'conv2.0.downsample.1.bias', 'conv2.0.downsample.1.running_mean', 'conv2.0.downsample.1.running_var', 'conv2.0.downsample.1.num_batches_tracked', 'conv2.1.conv1.weight', 'conv2.1.conv2.weight', 'conv3.0.conv1.weight', 'conv3.0.conv2.weight', 'conv3.0.downsample.0.weight', 'conv3.0.downsample.1.weight', 'conv3.0.downsample.1.bias', 'conv3.0.downsample.1.running_mean', 'conv3.0.downsample.1.running_var', 'conv3.0.downsample.1.num_batches_tracked', 'conv3.1.conv1.weight', 'conv3.1.conv2.weight', 'conv4.0.conv1.weight', 'conv4.0.conv2.weight', 'conv4.0.downsample.0.weight', 'conv4.0.downsample.1.weight', 'conv4.0.downsample.1.bias', 'conv4.0.downsample.1.running_mean', 'conv4.0.downsample.1.running_var', 'conv4.0.downsample.1.num_batches_tracked', 'conv4.1.conv1.weight', 'conv4.1.conv2.weight', 'conv4.2.conv1.weight', 'conv4.2.conv2.weight', 'conv5.0.conv1.weight', 'conv5.0.conv2.weight', 'conv5.0.downsample.0.weight', 'conv5.0.downsample.1.weight', 'conv5.0.downsample.1.bias', 'conv5.0.downsample.1.running_mean', 'conv5.0.downsample.1.running_var', 'conv5.0.downsample.1.num_batches_tracked', 'conv5.1.conv1.weight', 'conv5.1.conv2.weight', 'conv5.2.conv1.weight', 'conv5.2.conv2.weight', 'conv6.0.conv1.weight', 'conv6.0.conv2.weight', 'conv6.0.downsample.0.weight', 'conv6.0.downsample.1.weight', 'conv6.0.downsample.1.bias', 'conv6.0.downsample.1.running_mean', 'conv6.0.downsample.1.running_var', 'conv6.0.downsample.1.num_batches_tracked', 'conv6.1.conv1.weight', 'conv6.1.conv2.weight', 'conv6.2.conv1.weight', 'conv6.2.conv2.weight', 'conv7.0.conv1.weight', 'conv7.0.conv2.weight', 'conv7.0.downsample.0.weight', 'conv7.0.downsample.1.weight', 'conv7.0.downsample.1.bias', 'conv7.0.downsample.1.running_mean', 'conv7.0.downsample.1.running_var', 'conv7.0.downsample.1.num_batches_tracked', 'conv7.1.conv1.weight', 'conv7.1.conv2.weight', 'conv7.2.conv1.weight', 'conv7.2.conv2.weight']
+    #     pretrained_dict = {k: v for k, v in weights['state_dict'].items() if k in model_dict}
+    #     new_weights = sf_net.state_dict()
+    #     new_weights.update(pretrained_dict)
+    #     sf_net.load_state_dict(new_weights, strict=False)
     else:
         sf_net.init_weights()
 
-    if args.pretrained_disp:
-        print("=> using pre-trained weights for DispNet")
-        weights = torch.load(args.pretrained_disp)
-        disp_net.load_state_dict(weights['state_dict'], strict=True)
-    else:
-        disp_net.init_weights()
+    if args.with_depth:
+        if args.pretrained_disp:
+            print("=> using pre-trained weights for DispNet")
+            weights = torch.load(args.pretrained_disp)
+            disp_net.load_state_dict(weights['state_dict'], strict=True)
+        else:
+            disp_net.init_weights()
 
     cudnn.benchmark = True
     sf_net = torch.nn.DataParallel(sf_net)
-    disp_net = torch.nn.DataParallel(disp_net)
+    if args.with_depth:
+        disp_net = torch.nn.DataParallel(disp_net)
 
     print('=> setting adam solver')
 
@@ -218,7 +243,7 @@ def main():
 
     with open(args.save_path/args.log_full, 'w') as csvfile:
         writer = csv.writer(csvfile, delimiter='\t')
-        writer.writerow(['photo_loss', 'smooth_loss', 'flow_loss', 'train_loss'])
+        writer.writerow(['photo_loss', 'smooth_loss', 'flow_loss', 'consistency_loss', 'occlusion_loss', 'train_loss'])
         # writer.writerow(['photo_loss', 'smooth_loss', 'train_loss'])
 
     logger = TermLogger(n_epochs=args.epochs, train_size=min(
@@ -235,8 +260,7 @@ def main():
                 errors, error_names = validate_without_gt(args, val_loader, sf_net, 0, logger)
             for error, name in zip(errors, error_names):
                 training_writer.add_scalar(name, error, 0)
-            error_string = ', '.join('{} : {:.3f}'.format(name, error)
-                                     for name, error in zip(error_names[2:9], errors[2:9]))
+            error_string = ', '.join('{} : {:.3f}'.format(name, error) for name, error in zip(error_names[2:9], errors[2:9]))
             logger.valid_writer.write(' * Avg {}'.format(error_string))
 
     for epoch in range(args.epochs):
@@ -287,12 +311,12 @@ def train(args, train_loader, sf_net, disp_net, optimizer, epoch_size, logger, t
     batch_time = AverageMeter()
     data_time = AverageMeter()
     losses = AverageMeter(precision=4)
-    w1, w2, w3 = args.photo_loss_weight, args.smooth_loss_weight, args.flow_loss_weight
-    # w1, w2 = args.photo_loss_weight, args.smooth_loss_weight
+    w1, w2, w3, w4, w5 = args.photo_loss_weight, args.smooth_loss_weight, args.flow_loss_weight, args.flow_consistency_weight, args.occlusion_guide_weight
 
     # switch to train mode
     sf_net.train()
-    disp_net.eval()
+    if args.with_depth:
+        disp_net.eval()
 
     end = time.time()
     logger.train_bar.update(0)
@@ -325,17 +349,46 @@ def train(args, train_loader, sf_net, disp_net, optimizer, epoch_size, logger, t
             plt.figure(2); plt.imshow(bbb); plt.colorbar(); plt.tight_layout(); plt.ion(); plt.show();
             plt.figure(3); plt.imshow(ccc); plt.colorbar(); plt.tight_layout(); plt.ion(); plt.show();
 
+            viz_filter(sf_net)
+            
+            aaa = sf_net.module.conv1[0].weight
+            bbb = sf_net.module.conv1[2].weight
+            ccc = sf_net.module.conv5[0].conv1.weight
+            ddd = sf_net.module.conv7[0].conv2.weight
+            eee = sf_net.module.conv7[2].conv2.weight
+            p (aaa.abs()<0.001).sum()/(aaa.abs()<9999).sum().float()
+            p (bbb.abs()<0.001).sum()/(bbb.abs()<9999).sum().float()
+            p (ccc.abs()<0.001).sum()/(ccc.abs()<9999).sum().float()
+            p (ddd.abs()<0.001).sum()/(ddd.abs()<9999).sum().float()
+            p (eee.abs()<0.001).sum()/(eee.abs()<9999).sum().float()
+
         '''
 
         # compute output
-        tgt_depth = 1/disp_net(tgt_img).detach()
-        ref_depths = [1/disp_net(ref_img).detach() for ref_img in ref_imgs]
+        if args.with_depth:
+            tgt_depth = 1/disp_net(tgt_img).detach()
+            ref_depths = [1/disp_net(ref_img).detach() for ref_img in ref_imgs]
+        # pdb.set_trace()
 
-        if args.fwd_flow:
+        """About two-way-flow"""
+        '''
+            Input: single frame -> 4ch output inv/fwd flows
+            
+            [1st two xy-channels] inv_r2t_flows: {(I_ref, P_t2r) input -> F_r2t} => {(I_ref, P_r2t) input -> F_r2t}
+            [2nd two xy-channels] fwd_t2r_flows: {(I_ref, P_r2t) input -> F_t2r}
+            
+            [1st two xy-channels] inv_t2r_flows: {(I_tgt, P_r2t) input -> F_t2r} => {(I_tgt, P_t2r) input -> F_t2r}
+            [2nd two xy-channels] fwd_r2t_flows: {(I_tgt, P_t2r) input -> F_r2t}
+        
+            compute_two_way_flow(sf_net, tgt_img, ref_imgs, r2t_poses, t2r_poses)
+        '''
+        if args.two_way_flow:
+            inv_r2t_flows, fwd_t2r_flows, inv_t2r_flows, fwd_r2t_flows = compute_two_way_flow(sf_net, tgt_img, ref_imgs, r2t_poses_c, t2r_poses_c)
+        elif args.fwd_flow:
             r2t_flows, t2r_flows = compute_fwd_flow(sf_net, tgt_img, ref_imgs, r2t_poses_c, t2r_poses_c)
         else:
-            r2t_flows, t2r_flows = compute_flow(sf_net, tgt_img, ref_imgs, r2t_poses_c, t2r_poses_c)
-        # poses, poses_inv = compute_pose_with_inv(pose_net, tgt_img, ref_imgs)
+            r2t_flows, t2r_flows = compute_inv_flow(sf_net, tgt_img, ref_imgs, r2t_poses_c, t2r_poses_c)
+
         # pdb.set_trace()
         '''
             ### dpoint ###
@@ -343,9 +396,11 @@ def train(args, train_loader, sf_net, disp_net, optimizer, epoch_size, logger, t
             plt.close('all')
             bb = 1
             aaa = tgt_img[bb].detach().cpu().numpy().transpose(1,2,0) * 0.5 + 0.5
-            bbb = r2t_flows[0][0][bb,0].detach().cpu().numpy()
+            bbb = ref_imgs[0][bb].detach().cpu().numpy().transpose(1,2,0) * 0.5 + 0.5
+            ccc = r2t_flows[0][0][bb,0].detach().cpu().numpy()
             plt.figure(1); plt.imshow(aaa); plt.colorbar(); plt.tight_layout(); plt.ion(); plt.show();
-            plt.figure(2); plt.imshow(bbb, cmap='plasma'); plt.colorbar(); plt.tight_layout(); plt.ion(); plt.show();
+            plt.figure(2); plt.imshow(bbb); plt.colorbar(); plt.tight_layout(); plt.ion(); plt.show();
+            plt.figure(3); plt.imshow(ccc, cmap='plasma'); plt.colorbar(); plt.tight_layout(); plt.ion(); plt.show();
 
             
             plt.close('all')
@@ -359,18 +414,54 @@ def train(args, train_loader, sf_net, disp_net, optimizer, epoch_size, logger, t
             plt.figure(2); plt.imshow(bbb, cmap='plasma', vmax=0.5); plt.colorbar(); plt.tight_layout(); plt.ion(); plt.show();
             aaa = pose_vec2mat(poses[0], rotation_mode='euler')
         '''
+        if args.two_way_flow:
+            if args.with_depth:
+                loss_3  = compute_rigid_flow_loss(tgt_img, ref_imgs, inv_r2t_flows, inv_t2r_flows, tgt_depth, ref_depths, r2t_poses, t2r_poses, intrinsics, args)
+                loss_3 += compute_rigid_flow_loss(tgt_img, ref_imgs, fwd_r2t_flows, fwd_t2r_flows, tgt_depth, ref_depths, r2t_poses, t2r_poses, intrinsics, args)
+            else:
+                loss_3 = torch.tensor(.0).cuda()
 
-        loss_1 = compute_photo_loss(tgt_img, ref_imgs, r2t_flows, t2r_flows, args)
-        loss_2 = compute_flow_smooth_loss(r2t_flows, tgt_img, t2r_flows, ref_imgs)
-        loss_3 = compute_rigid_flow_loss(tgt_img, ref_imgs, r2t_flows, t2r_flows, tgt_depth, ref_depths, r2t_poses, t2r_poses, intrinsics, args)
+            if w4 == 0:
+                loss_4 = torch.tensor(.0).cuda()
+                ref_pred_noccs, ref_curr_noccs = [[None], [None]], [[None], [None]]
+                tgt_pred_noccs, tgt_curr_noccs = [[None], [None]], [[None], [None]]
+            else:
+                loss_c1, ref_pred_noccs, ref_curr_noccs = compute_flow_consistency_loss(inv_r2t_flows, fwd_t2r_flows, args)   # ref-input
+                loss_c2, tgt_pred_noccs, tgt_curr_noccs = compute_flow_consistency_loss(inv_t2r_flows, fwd_r2t_flows, args)   # tgt-input
+                loss_4 = loss_c1 + loss_c2
 
-        # loss = w1*loss_1 + w2*loss_2
-        loss = w1*loss_1 + w2*loss_2 + w3*loss_3
+            if w5 == 0:
+                loss_5 = torch.tensor(.0).cuda()
+            else:
+                loss_5 = compute_occ_guide_loss(ref_imgs, [tgt_img, tgt_img], inv_r2t_flows, fwd_t2r_flows, ref_in_noccs_tgt, ref_in_noccs_ref, args)
+                loss_5 += compute_occ_guide_loss([tgt_img, tgt_img], ref_imgs, inv_t2r_flows, fwd_r2t_flows, tgt_in_noccs_ref, tgt_in_noccs_tgt, args)
+
+            # ref_pred_noccs, ref_curr_noccs = compute_weight_mask(inv_r2t_flows, fwd_t2r_flows, args)    # ref-input
+            # tgt_pred_noccs, tgt_curr_noccs = compute_weight_mask(inv_t2r_flows, fwd_r2t_flows, args)    # tgt-input
+
+            # loss_1 = compute_photo_loss(tgt_img, ref_imgs, inv_r2t_flows, inv_t2r_flows, args, ref_in_noccs_tgt, tgt_in_noccs_ref)
+            # loss_1 += compute_photo_loss(tgt_img, ref_imgs, fwd_r2t_flows, fwd_t2r_flows, args, tgt_in_noccs_tgt, ref_in_noccs_ref)
+            loss_1  = compute_photo_loss(ref_imgs, [tgt_img, tgt_img], inv_r2t_flows, fwd_t2r_flows, args, ref_pred_noccs, ref_curr_noccs)
+            loss_1 += compute_photo_loss([tgt_img, tgt_img], ref_imgs, inv_t2r_flows, fwd_r2t_flows, args, tgt_pred_noccs, tgt_curr_noccs)
+            loss_2  = compute_flow_smooth_loss(inv_r2t_flows, tgt_img, inv_t2r_flows, ref_imgs) * (1/10)
+            loss_2 += compute_flow_smooth_loss(fwd_r2t_flows, tgt_img, fwd_t2r_flows, ref_imgs)
+        else:
+            if args.with_depth:
+                loss_3 = compute_rigid_flow_loss(tgt_img, ref_imgs, r2t_flows, t2r_flows, tgt_depth, ref_depths, r2t_poses, t2r_poses, intrinsics, args)
+            else:
+                loss_3 = torch.tensor(.0).cuda()
+            loss_1 = compute_photo_loss(tgt_img, ref_imgs, r2t_flows, t2r_flows, args)
+            loss_2 = compute_flow_smooth_loss(r2t_flows, tgt_img, t2r_flows, ref_imgs)            
+
+        loss = w1*loss_1 + w2*loss_2 + w3*loss_3 + w4*loss_4 + w5*loss_5
+        # pdb.set_trace()
 
         if log_losses:
             train_writer.add_scalar('photo_loss', loss_1.item(), n_iter)
             train_writer.add_scalar('smooth_loss', loss_2.item(), n_iter)
             train_writer.add_scalar('flow_loss', loss_3.item(), n_iter)
+            train_writer.add_scalar('consistency_loss', loss_4.item(), n_iter)
+            train_writer.add_scalar('occlusion_loss', loss_5.item(), n_iter)
             train_writer.add_scalar('total_loss', loss.item(), n_iter)
 
         # record loss and EPE
@@ -387,8 +478,7 @@ def train(args, train_loader, sf_net, disp_net, optimizer, epoch_size, logger, t
 
         with open(args.save_path/args.log_full, 'a') as csvfile:
             writer = csv.writer(csvfile, delimiter='\t')
-            writer.writerow([loss_1.item(), loss_2.item(), loss_3.item(), loss.item()])
-            # writer.writerow([loss_1.item(), loss_2.item(), loss.item()])
+            writer.writerow([loss_1.item(), loss_2.item(), loss_3.item(), loss_4.item(), loss_5.item(), loss.item()])
         logger.train_bar.update(i+1)
         if i % args.print_freq == 0:
             logger.train_writer.write(
@@ -431,14 +521,30 @@ def validate_without_gt(args, val_loader, sf_net, epoch, logger):
         r2t_poses = convert_pose(r2t_poses, output_rot_mode=args.rotation_mode)
         t2r_poses = convert_pose(t2r_poses, output_rot_mode=args.rotation_mode)
 
-        # compute output
-        r2t_flows, t2r_flows = [], []
-        if args.fwd_flow:
+        """ compute output """
+        if args.two_way_flow:
+            inv_r2t_flows, fwd_t2r_flows = [], []
+            inv_t2r_flows, fwd_r2t_flows = [], []
+            for ref_img, r2t_pose in zip(ref_imgs, r2t_poses):
+                outputs = [sf_net(ref_img, r2t_pose)]
+                inv_flows = [output[:,:2] for output in outputs]
+                fwd_flows = [output[:,2:] for output in outputs]
+                inv_r2t_flows.append( inv_flows )
+                fwd_t2r_flows.append( fwd_flows )
+            for t2r_pose in t2r_poses:
+                outputs = [sf_net(tgt_img, t2r_pose)]
+                inv_flows = [output[:,:2] for output in outputs]
+                fwd_flows = [output[:,2:] for output in outputs]
+                inv_t2r_flows.append( inv_flows )
+                fwd_r2t_flows.append( fwd_flows )
+        elif args.fwd_flow:
+            r2t_flows, t2r_flows = [], []
             for t2r_pose in t2r_poses:
                 r2t_flows.append( [sf_net(tgt_img, t2r_pose)] )
             for ref_img, r2t_pose in zip(ref_imgs, r2t_poses):
                 t2r_flows.append( [sf_net(ref_img, r2t_pose)] )
         else:
+            r2t_flows, t2r_flows = [], []
             for ref_img, r2t_pose in zip(ref_imgs, r2t_poses):
                 r2t_flows.append( [sf_net(ref_img, r2t_pose)] )
             for t2r_pose in t2r_poses:
@@ -453,9 +559,16 @@ def validate_without_gt(args, val_loader, sf_net, epoch, logger):
             plt.figure(2); plt.imshow(bbb, cmap='plasma'); plt.colorbar(); plt.tight_layout(); plt.ion(); plt.show();
 
         '''
-
-        loss_1 = compute_photo_loss(tgt_img, ref_imgs, r2t_flows, t2r_flows, args)
-        loss_2 = compute_flow_smooth_loss(r2t_flows, tgt_img, t2r_flows, ref_imgs)
+        if args.two_way_flow:
+            loss_1  = compute_photo_loss(ref_imgs, [tgt_img, tgt_img], inv_r2t_flows, fwd_t2r_flows, args)
+            loss_1 += compute_photo_loss([tgt_img, tgt_img], ref_imgs, inv_t2r_flows, fwd_r2t_flows, args)
+            # loss_1  = compute_photo_loss(tgt_img, ref_imgs, inv_r2t_flows, inv_t2r_flows, args)
+            # loss_1 += compute_photo_loss(tgt_img, ref_imgs, fwd_r2t_flows, fwd_t2r_flows, args)
+            loss_2  = compute_flow_smooth_loss(inv_r2t_flows, tgt_img, inv_t2r_flows, ref_imgs) * (1/10)
+            loss_2 += compute_flow_smooth_loss(fwd_r2t_flows, tgt_img, fwd_t2r_flows, ref_imgs)
+        else:
+            loss_1 = compute_photo_loss(tgt_img, ref_imgs, r2t_flows, t2r_flows, args)
+            loss_2 = compute_flow_smooth_loss(r2t_flows, tgt_img, t2r_flows, ref_imgs)
 
         loss_1 = loss_1.item()
         loss_2 = loss_2.item()
@@ -509,6 +622,34 @@ def validate_with_gt(args, val_loader, disp_net, epoch, logger):
                 batch_time, errors.val[0], errors.avg[0]))
     logger.valid_bar.update(len(val_loader))
     return errors.avg, error_names
+
+
+
+def compute_flow_warp(img, flo):
+    # img: b x c x h x w
+    # flo: b x 2 x h x w
+    bs, _, gh, gw = img.size()
+    mgrid_np = np.expand_dims(np.mgrid[0:gw,0:gh].transpose(0,2,1).astype(np.float32),0).repeat(bs, axis=0)
+    mgrid = torch.from_numpy(mgrid_np).cuda()
+    grid = mgrid.add(flo).permute(0,2,3,1)     # bx2x80x160 -> bx80x160x2
+                     
+    grid[:,:,:,0] = grid[:,:,:,0].sub(gw/2).div(gw/2)
+    grid[:,:,:,1] = grid[:,:,:,1].sub(gh/2).div(gh/2)
+    
+    if np.array(torch.__version__[:3]).astype(float) >= 1.3:
+        img_w = F.grid_sample(img, grid, align_corners=True)
+    else:
+        img_w = F.grid_sample(img, grid)
+
+    valid = (grid.abs().max(dim=-1)[0] <= 1).unsqueeze(1).float()
+
+    return img_w
+
+
+def compute_L2_norm(x, dim=1, keepdim=True):
+    curr_offset = 1e-10
+    l2_norm = torch.norm(torch.abs(x) + curr_offset, dim=dim, keepdim=True)
+    return l2_norm
 
 
 def compute_depth(disp_net, tgt_img, ref_imgs):
@@ -566,7 +707,7 @@ def convert_pose(poses, output_rot_mode="quaternion"):
     return output_poses
     
 
-def compute_flow(sf_net, tgt_img, ref_imgs, r2t_poses, t2r_poses):
+def compute_inv_flow(sf_net, tgt_img, ref_imgs, r2t_poses, t2r_poses):
     r2t_flows = []
     for ref_img, r2t_pose in zip(ref_imgs, r2t_poses):
         r2t_flows.append( sf_net(ref_img, r2t_pose) )
@@ -590,6 +731,38 @@ def compute_fwd_flow(sf_net, tgt_img, ref_imgs, r2t_poses, t2r_poses):
     return r2t_flows, t2r_flows
 
 
+def compute_two_way_flow(sf_net, tgt_img, ref_imgs, r2t_poses, t2r_poses):
+    """About two-way-flow"""
+    '''
+        Input: single frame -> 4ch output inv/fwd flows
+        
+        [1st two xy-channels] inv_r2t_flows: {(I_ref, P_t2r) input -> F_r2t} => {(I_ref, P_r2t) input -> F_r2t}
+        [2nd two xy-channels] fwd_t2r_flows: {(I_ref, P_r2t) input -> F_t2r}
+        
+        [1st two xy-channels] inv_t2r_flows: {(I_tgt, P_r2t) input -> F_t2r} => {(I_tgt, P_t2r) input -> F_t2r}
+        [2nd two xy-channels] fwd_r2t_flows: {(I_tgt, P_t2r) input -> F_r2t}
+        
+    '''
+    inv_r2t_flows, fwd_t2r_flows = [], []
+    inv_t2r_flows, fwd_r2t_flows = [], []
+
+    for ref_img, r2t_pose in zip(ref_imgs, r2t_poses):
+        outputs = sf_net(ref_img, r2t_pose)
+        inv_flows = [output[:,:2] for output in outputs]
+        fwd_flows = [output[:,2:] for output in outputs]
+        inv_r2t_flows.append( inv_flows )
+        fwd_t2r_flows.append( fwd_flows )
+
+    for t2r_pose in t2r_poses:
+        outputs = sf_net(tgt_img, t2r_pose)
+        inv_flows = [output[:,:2] for output in outputs]
+        fwd_flows = [output[:,2:] for output in outputs]
+        inv_t2r_flows.append( inv_flows )
+        fwd_r2t_flows.append( fwd_flows )
+
+    return inv_r2t_flows, fwd_t2r_flows, inv_t2r_flows, fwd_r2t_flows
+
+
 def compute_pose_with_inv(pose_net, tgt_img, ref_imgs):
     poses = []
     poses_inv = []
@@ -606,6 +779,32 @@ def compute_pose(pose_net, tgt_img, ref_imgs):
         poses.append(pose_net(tgt_img, ref_img))
 
     return poses
+
+
+def compute_weight_mask(inv_flows, fwd_flows, args):
+    pred_noccs, curr_noccs = [], []
+
+    num_scales = min(len(inv_flows[0]), args.num_scales)
+    for inv_flow, fwd_flow in zip(inv_flows, fwd_flows):
+        pred_noccs_scale, curr_noccs_scale = [], []
+        for s in range(num_scales):
+            inv2fwd_flow, inv2fwd_val = inv_warp(inv_flow[s], fwd_flow[s])
+            fwd2inv_flow, fwd2inv_val = inv_warp(fwd_flow[s], inv_flow[s])
+
+            fwd_flow_diff_norm = ( compute_L2_norm(torch.abs(fwd_flow[s] + inv2fwd_flow)) / compute_L2_norm(torch.abs(fwd_flow[s] - inv2fwd_flow)).clamp(min=1e-6) ).clamp(0,1)
+            inv_flow_diff_norm = ( compute_L2_norm(torch.abs(inv_flow[s] + fwd2inv_flow)) / compute_L2_norm(torch.abs(fwd_flow[s] - inv2fwd_flow)).clamp(min=1e-6) ).clamp(0,1)
+
+            fwd_weight_mask = (1 - fwd_flow_diff_norm) * inv2fwd_val
+            inv_weight_mask = (1 - inv_flow_diff_norm) * fwd2inv_val
+
+            pred_noccs_scale.append(inv_weight_mask)
+            curr_noccs_scale.append(fwd_weight_mask)
+
+        pred_noccs.append(pred_noccs_scale)
+        curr_noccs.append(curr_noccs_scale)
+
+    return pred_noccs, curr_noccs
+
 
 
 if __name__ == '__main__':

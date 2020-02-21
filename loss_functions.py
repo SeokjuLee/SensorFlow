@@ -7,11 +7,11 @@ import math
 from matplotlib import pyplot as plt
 import numpy as np
 from flow_utils import vis_flow
+from torch_sparse import coalesce
+
 import pdb
 
-device = torch.device(
-    "cuda") if torch.cuda.is_available() else torch.device("cpu")
-
+device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 
 pixel_uv = None
 
@@ -25,21 +25,16 @@ def set_id_grid(flow):
     pixel_uv = torch.stack((j_range, i_range), dim=1)  # [1, 2, H, W]
 
 
-def flow_warp(img, flow):
+def inv_warp(img, flo):
     '''
-    img:  b x 3 x h x w
-    flow: b x 2 x h x w
+    img: b x 3 x h x w
+    flo: b x 2 x h x w
     '''
-    bs, _, gh, gw = img.size()
+    bs, ch, gh, gw = img.size()
     mgrid_np = np.expand_dims(np.mgrid[0:gw,0:gh].transpose(0,2,1).astype(np.float32),0).repeat(bs, axis=0)
-    if flow.is_cuda == True: 
-        mgrid = torch.from_numpy(mgrid_np).cuda()
-    else: 
-        mgrid = torch.from_numpy(mgrid_np)
-    grid = mgrid.add(flow).permute(0,2,3,1)
+    mgrid = torch.from_numpy(mgrid_np).type_as(flo)
+    grid = mgrid.add(flo).permute(0,2,3,1)   # b x 2 x gh x gw
 
-    # grid = mgrid.add(flo12_.div(self.downscale*(2**i))).transpose(1,2).transpose(2,3)
-    #                     # bx2x80x160 -> bx80x2x160 -> bx80x160x2
     grid[:,:,:,0] = grid[:,:,:,0].sub(gw/2).div(gw/2)
     grid[:,:,:,1] = grid[:,:,:,1].sub(gh/2).div(gh/2)
     
@@ -48,23 +43,89 @@ def flow_warp(img, flow):
     else:
         img_w = F.grid_sample(img, grid)
 
-    return img_w
+    valid = (grid.abs().max(dim=-1)[0] <= 1).unsqueeze(1).float()
+
+    img_w[(valid==0).repeat(1,ch,1,1)] = 0
+
+    return img_w, valid
 
 
-def compute_photo_loss(tgt_img, ref_imgs, r2t_flows, t2r_flows, args):
+def fwd_warp(img, flo, upscale=2):
+    '''
+    img: b x 3 x h x w
+    flo: b x 2 x h x w
+    '''
+    img = F.interpolate(img, scale_factor=upscale)
+    flo = F.interpolate(flo, scale_factor=upscale) * upscale
+    bs, ch, gh, gw = img.size()
+    mgrid_np = np.expand_dims(np.mgrid[0:gw,0:gh].transpose(0,2,1).astype(np.float32),0).repeat(bs, axis=0)
+    mgrid = torch.from_numpy(mgrid_np).type_as(flo)
+    grid = mgrid.add(flo)   # b x 2 x gh x gw
+
+    hh, ww = int(gh/upscale), int(gw/upscale)
+
+    image_w, valid_w = [], []
+    for bb in range(bs):
+        coo = grid[bb].reshape(2,-1)
+        rgb = img[bb].reshape(3,-1).permute(1,0)
+        idx = coo.long()[[1,0]]
+        idx[0][idx[0]<0] = gh
+        idx[0][idx[0]>gh-1] = gh
+        idx[1][idx[1]<0] = gw
+        idx[1][idx[1]>gw-1] = gw
+        idx = idx / upscale
+        _idx, _val = coalesce(idx, rgb, m=hh+1, n=ww+1, op='mean')
+        image_w.append( torch.sparse.FloatTensor(_idx, _val, torch.Size([hh+1,ww+1,3])).to_dense()[:-1,:-1].permute(2,0,1) )
+        valid_w.append( (1- (torch.sparse.FloatTensor(_idx, _val, torch.Size([hh+1,ww+1,3])).to_dense()[:-1,:-1]==0).float()).prod(dim=2).unsqueeze(0) )
+    image_w = torch.stack(image_w, dim=0)
+    valid_w = torch.stack(valid_w, dim=0)
+
+    image_w[(valid_w==0).repeat(1,ch,1,1)] = 0
+
+    return image_w, valid_w
+
+
+def L2_norm(x, dim=1, keepdim=True):
+    curr_offset = 1e-10
+    l2_norm = torch.norm(torch.abs(x) + curr_offset, dim=dim, keepdim=True)
+    return l2_norm
+
+
+"""
+def compute_photo_loss(tgt_img, ref_imgs, r2t_flows, t2r_flows, args, tgt_noccs=[[None], [None]], ref_noccs=[[None], [None]]):
     photo_loss = 0
 
     num_scales = min(len(r2t_flows[0]), args.num_scales)
-    for ref_img, r2t_flow, t2r_flow in zip(ref_imgs, r2t_flows, t2r_flows):
+    for ref_img, r2t_flow, t2r_flow, tgt_nocc, ref_nocc in zip(ref_imgs, r2t_flows, t2r_flows, tgt_noccs, ref_noccs):
         for s in range(num_scales):
             b, _, h, w = r2t_flow[s].size()
-            downscale = tgt_img.size(2)/h
 
             tgt_img_scaled = F.interpolate(tgt_img, (h, w), mode='area')
             ref_img_scaled = F.interpolate(ref_img, (h, w), mode='area')
+            # pdb.set_trace()
 
-            photo_loss1 = compute_pairwise_warp_loss(ref_img_scaled, tgt_img_scaled, r2t_flow[s], args)
-            photo_loss2 = compute_pairwise_warp_loss(tgt_img_scaled, ref_img_scaled, t2r_flow[s], args)
+            photo_loss1 = compute_pairwise_warp_loss(ref_img_scaled, tgt_img_scaled, r2t_flow[s], args, tgt_nocc[s])
+            photo_loss2 = compute_pairwise_warp_loss(tgt_img_scaled, ref_img_scaled, t2r_flow[s], args, ref_nocc[s])
+            # pdb.set_trace()
+
+            photo_loss += (photo_loss1 + photo_loss2)
+
+    return photo_loss
+"""
+
+def compute_photo_loss(curr_imgs, pred_imgs, inv_flows, fwd_flows, args, pred_noccs=[[None], [None]], curr_noccs=[[None], [None]]):
+    photo_loss = 0
+
+    num_scales = min(len(inv_flows[0]), args.num_scales)
+    for curr_img, pred_img, inv_flow, fwd_flow, pred_nocc, curr_nocc in zip(curr_imgs, pred_imgs, inv_flows, fwd_flows, pred_noccs, curr_noccs):
+        for s in range(num_scales):
+            b, _, h, w = inv_flow[s].size()
+
+            curr_img_scaled = F.interpolate(curr_img, (h, w), mode='area')
+            pred_img_scaled = F.interpolate(pred_img, (h, w), mode='area')
+
+            photo_loss1 = compute_pairwise_warp_loss(curr_img_scaled, pred_img_scaled, inv_flow[s], args, pred_nocc[s])
+            photo_loss2 = compute_pairwise_warp_loss(pred_img_scaled, curr_img_scaled, fwd_flow[s], args, curr_nocc[s])
             # pdb.set_trace()
 
             photo_loss += (photo_loss1 + photo_loss2)
@@ -72,7 +133,7 @@ def compute_photo_loss(tgt_img, ref_imgs, r2t_flows, t2r_flows, args):
     return photo_loss
 
 
-def compute_pairwise_warp_loss(ref_img, tgt_img, flow, args):
+def compute_pairwise_warp_loss(ref_img, tgt_img, flow, args, tgt_nocc):
     global pixel_uv
     b, _, h, w = flow.size()
     if (pixel_uv is None) or pixel_uv.size(2) != h:
@@ -98,9 +159,12 @@ def compute_pairwise_warp_loss(ref_img, tgt_img, flow, args):
 
     valid_grid = flow_grid.abs().max(dim=-1)[0] <= 1
     valid_grid = valid_grid.unsqueeze(1).float()
+    # pdb.set_trace()
     '''
-        plt.close('all'); bb = 0
+        bb = 0
+        plt.close('all');
         plt.figure(1); plt.imshow(valid_grid[bb,0].detach().cpu().numpy()); plt.colorbar(); plt.ion(); plt.show();
+        plt.figure(2); plt.imshow(tgt_nocc[bb,0].detach().cpu().numpy()); plt.colorbar(); plt.ion(); plt.show();
     
     '''
 
@@ -110,9 +174,249 @@ def compute_pairwise_warp_loss(ref_img, tgt_img, flow, args):
         ssim_map = (0.5*(1-ssim(tgt_img, r2t_img))).clamp(0, 1)
         diff_img = (0.15 * diff_img + 0.85 * ssim_map)
 
+    if tgt_nocc is not None:
+        valid_grid = valid_grid * tgt_nocc
+
     reconstruction_loss = mean_on_mask(diff_img, valid_grid)
 
     return reconstruction_loss
+
+
+"""
+def compute_flow_consistency_loss(r2t_flows, t2r_flows, args, alpha1=0.01, alpha2=0.5):
+    loss = 0
+    noc_masks_tgt, noc_masks_ref = [], []
+
+    num_scales = min(len(r2t_flows[0]), args.num_scales)
+    for r2t_flow, t2r_flow in zip(r2t_flows, t2r_flows):
+        noc_masks_tgt_scale, noc_masks_ref_scale = [], []
+        for s in range(num_scales):
+            tr2rt_flow = inv_warp(t2r_flow[s], r2t_flow[s])
+            rt2tr_flow = inv_warp(r2t_flow[s], t2r_flow[s])
+
+            r2t_flow_diff = torch.abs(tr2rt_flow + r2t_flow[s])
+            t2r_flow_diff = torch.abs(rt2tr_flow + t2r_flow[s])
+
+            r2t_consist_bound = alpha1 * (L2_norm(r2t_flow[s]) + L2_norm(tr2rt_flow)) + alpha2
+            t2r_consist_bound = alpha1 * (L2_norm(t2r_flow[s]) + L2_norm(rt2tr_flow)) + alpha2
+
+            noc_mask_ref = (L2_norm(t2r_flow_diff) < t2r_consist_bound).type(torch.FloatTensor).cuda()
+            noc_mask_tgt = (L2_norm(r2t_flow_diff) < r2t_consist_bound).type(torch.FloatTensor).cuda()
+
+            noc_masks_tgt_scale.append(noc_mask_tgt)
+            noc_masks_ref_scale.append(noc_mask_ref)
+
+            loss += 1/2 * \
+                    ( (r2t_flow_diff.mean(dim=1, keepdim=True) * noc_mask_tgt).sum() / torch.clamp(noc_mask_tgt.sum(), min=1e-10) + \
+                      (t2r_flow_diff.mean(dim=1, keepdim=True) * noc_mask_ref).sum() / torch.clamp(noc_mask_ref.sum(), min=1e-10) )
+
+        noc_masks_tgt.append(noc_masks_tgt_scale)
+        noc_masks_ref.append(noc_masks_ref_scale)
+
+    return loss, noc_masks_tgt, noc_masks_ref
+"""
+
+
+"""
+def compute_flow_consistency_loss(curr_imgs, pred_imgs, inv_flows, fwd_flows, args, alpha1=0.01, alpha2=0.5):
+    loss = 0
+    pred_noccs, curr_noccs = [], []
+
+    num_scales = min(len(inv_flows[0]), args.num_scales)
+    for curr_img, pred_img, inv_flow, fwd_flow in zip(curr_imgs, pred_imgs, inv_flows, fwd_flows):
+        pred_noccs_scale, curr_noccs_scale = [], []
+        for s in range(num_scales):
+            b, _, h, w = inv_flow[s].size()
+            curr_img_scaled = F.interpolate(curr_img, (h, w), mode='area')
+            pred_img_scaled = F.interpolate(pred_img, (h, w), mode='area')
+
+            pred_nocc = fwd_warp(curr_img_scaled, fwd_flow[s], upscale=1)[1]    # ref input -> nocc mask on tgt
+            curr_nocc = fwd_warp(pred_img_scaled, inv_flow[s], upscale=1)[1]    # ref input -> nocc mask on ref
+
+            inv2fwd_flow, inv2fwd_val = inv_warp(inv_flow[s], fwd_flow[s])
+            fwd2inv_flow, fwd2inv_val = inv_warp(fwd_flow[s], inv_flow[s])
+
+            fwd_flow_diff = L2_norm(torch.abs(inv2fwd_flow + fwd_flow[s])) * inv2fwd_val
+            inv_flow_diff = L2_norm(torch.abs(fwd2inv_flow + inv_flow[s])) * fwd2inv_val
+            # pdb.set_trace()
+            '''
+                plt.close('all')
+                bb = 1
+                plt.figure(1); plt.imshow(pred_nocc[bb,0].detach().cpu()); plt.colorbar(); plt.grid(linestyle=':', linewidth=0.4); plt.ion(); plt.show();
+                plt.figure(2); plt.imshow(curr_nocc[bb,0].detach().cpu()); plt.colorbar(); plt.grid(linestyle=':', linewidth=0.4); plt.ion(); plt.show();
+                plt.figure(3); plt.imshow(fwd_flow_diff[bb,0].detach().cpu()); plt.colorbar(); plt.grid(linestyle=':', linewidth=0.4); plt.ion(); plt.show();
+                plt.figure(4); plt.imshow(inv_flow_diff[bb,0].detach().cpu()); plt.colorbar(); plt.grid(linestyle=':', linewidth=0.4); plt.ion(); plt.show();
+                plt.figure(5); plt.imshow((curr_nocc*fwd_flow_diff)[bb,0].detach().cpu()); plt.colorbar(); plt.grid(linestyle=':', linewidth=0.4); plt.ion(); plt.show();
+                plt.figure(6); plt.imshow((pred_nocc*inv_flow_diff)[bb,0].detach().cpu()); plt.colorbar(); plt.grid(linestyle=':', linewidth=0.4); plt.ion(); plt.show();
+
+            '''
+
+            pred_noccs_scale.append(pred_nocc)
+            curr_noccs_scale.append(curr_nocc)
+
+            loss += 1/2 * (fwd_flow_diff*curr_nocc).mean() + (inv_flow_diff*pred_nocc).mean()
+
+        pred_noccs.append(pred_noccs_scale)
+        curr_noccs.append(curr_noccs_scale)
+
+    return loss, pred_noccs, curr_noccs
+"""
+
+
+"""
+def compute_flow_consistency_loss_debug(curr_imgs, pred_imgs, inv_flows, fwd_flows, args):
+    loss = 0
+    pred_noccs, curr_noccs = [], []
+
+    num_scales = min(len(inv_flows[0]), args.num_scales)
+    for curr_img, pred_img, inv_flow, fwd_flow in zip(curr_imgs, pred_imgs, inv_flows, fwd_flows):
+        pred_noccs_scale, curr_noccs_scale = [], []
+        for s in range(num_scales):
+            b, _, h, w = inv_flow[s].size()
+            curr_img_scaled = F.interpolate(curr_img, (h, w), mode='area')
+            pred_img_scaled = F.interpolate(pred_img, (h, w), mode='area')
+
+            inv2fwd_flow, inv2fwd_val = inv_warp(inv_flow[s], fwd_flow[s])
+            fwd2inv_flow, fwd2inv_val = inv_warp(fwd_flow[s], inv_flow[s])
+
+            fwd_flow_diff_norm = ( L2_norm(torch.abs(fwd_flow[s] + inv2fwd_flow)) / L2_norm(torch.abs(fwd_flow[s] - inv2fwd_flow)).clamp(min=1e-6) ).clamp(0,1)
+            inv_flow_diff_norm = ( L2_norm(torch.abs(inv_flow[s] + fwd2inv_flow)) / L2_norm(torch.abs(fwd_flow[s] - inv2fwd_flow)).clamp(min=1e-6) ).clamp(0,1)
+
+            fwd_weight_mask = (1 - fwd_flow_diff_norm) * inv2fwd_val
+            inv_weight_mask = (1 - inv_flow_diff_norm) * fwd2inv_val
+
+            pred_noccs_scale.append(inv_weight_mask)
+            curr_noccs_scale.append(fwd_weight_mask)
+
+            # pdb.set_trace()
+            '''
+                # pred_nocc = fwd_warp(curr_img_scaled, fwd_flow[s], upscale=1)[1]    # ref input -> nocc mask on tgt
+                # curr_nocc = fwd_warp(pred_img_scaled, inv_flow[s], upscale=1)[1]    # ref input -> nocc mask on ref
+
+                alpha1=0.04, alpha2=1.0
+
+                fwd_flow_diff = L2_norm(torch.abs(fwd_flow[s] + inv2fwd_flow))# * inv2fwd_val
+                inv_flow_diff = L2_norm(torch.abs(inv_flow[s] + fwd2inv_flow))# * fwd2inv_val
+
+                fwd_consist_bound = alpha1 * (L2_norm(fwd_flow[s]) + L2_norm(inv2fwd_flow)) + alpha2
+                inv_consist_bound = alpha1 * (L2_norm(inv_flow[s]) + L2_norm(fwd2inv_flow)) + alpha2
+
+                fwd_noc_mask = (L2_norm(fwd_flow_diff) < fwd_consist_bound).type(torch.FloatTensor).cuda()
+                inv_noc_mask = (L2_norm(inv_flow_diff) < inv_consist_bound).type(torch.FloatTensor).cuda()
+
+                bb = 0
+                plt.close('all')
+                fig = plt.figure(1, figsize=(24, 8))
+                ea1 = 2; ea2 = 6; ii = 1;
+                fig.add_subplot(ea1,ea2,ii); ii += 1;
+                plt.imshow(curr_img[bb,0].detach().cpu()); plt.colorbar(); plt.text(0, 20, "curr_img", bbox={'facecolor': 'yellow', 'alpha': 0.5}); plt.grid(linestyle=':', linewidth=0.4);
+                fig.add_subplot(ea1,ea2,ii); ii += 1;
+                plt.imshow(fwd_flow_diff[bb,0].detach().cpu()); plt.colorbar(); plt.text(0, 20, "fwd_flow_diff", bbox={'facecolor': 'yellow', 'alpha': 0.5}); plt.grid(linestyle=':', linewidth=0.4);
+                fig.add_subplot(ea1,ea2,ii); ii += 1;
+                plt.imshow(fwd_consist_bound[bb,0].detach().cpu()); plt.colorbar(); plt.text(0, 20, "fwd_consist_bound", bbox={'facecolor': 'yellow', 'alpha': 0.5}); plt.grid(linestyle=':', linewidth=0.4);
+                fig.add_subplot(ea1,ea2,ii); ii += 1;
+                plt.imshow(fwd_noc_mask[bb,0].detach().cpu()); plt.colorbar(); plt.text(0, 20, "fwd_noc_mask", bbox={'facecolor': 'yellow', 'alpha': 0.5}); plt.grid(linestyle=':', linewidth=0.4);
+                fig.add_subplot(ea1,ea2,ii); ii += 1;
+                plt.imshow((fwd_noc_mask*fwd_flow_diff)[bb,0].detach().cpu()); plt.colorbar(); plt.text(0, 20, "fwd_noc_mask*fwd_flow_diff", bbox={'facecolor': 'yellow', 'alpha': 0.5}); plt.grid(linestyle=':', linewidth=0.4);
+                fig.add_subplot(ea1,ea2,ii); ii += 1;
+                plt.imshow(fwd_weight_mask[bb,0].detach().cpu()); plt.colorbar(); plt.text(0, 20, "fwd_weight_mask", bbox={'facecolor': 'yellow', 'alpha': 0.5}); plt.grid(linestyle=':', linewidth=0.4);
+                fig.add_subplot(ea1,ea2,ii); ii += 1;
+                plt.imshow(pred_img[bb,0].detach().cpu()); plt.colorbar(); plt.text(0, 20, "pred_img", bbox={'facecolor': 'yellow', 'alpha': 0.5}); plt.grid(linestyle=':', linewidth=0.4);
+                fig.add_subplot(ea1,ea2,ii); ii += 1;
+                plt.imshow(inv_flow_diff[bb,0].detach().cpu()); plt.colorbar(); plt.text(0, 20, "inv_flow_diff", bbox={'facecolor': 'yellow', 'alpha': 0.5}); plt.grid(linestyle=':', linewidth=0.4);
+                fig.add_subplot(ea1,ea2,ii); ii += 1;
+                plt.imshow(inv_consist_bound[bb,0].detach().cpu()); plt.colorbar(); plt.text(0, 20, "inv_consist_bound", bbox={'facecolor': 'yellow', 'alpha': 0.5}); plt.grid(linestyle=':', linewidth=0.4);
+                fig.add_subplot(ea1,ea2,ii); ii += 1;
+                plt.imshow(inv_noc_mask[bb,0].detach().cpu()); plt.colorbar(); plt.text(0, 20, "inv_noc_mask", bbox={'facecolor': 'yellow', 'alpha': 0.5}); plt.grid(linestyle=':', linewidth=0.4);
+                fig.add_subplot(ea1,ea2,ii); ii += 1;
+                plt.imshow((inv_noc_mask*inv_flow_diff)[bb,0].detach().cpu()); plt.colorbar(); plt.text(0, 20, "fwd_noc_mask*fwd_flow_diff", bbox={'facecolor': 'yellow', 'alpha': 0.5}); plt.grid(linestyle=':', linewidth=0.4);
+                fig.add_subplot(ea1,ea2,ii); ii += 1;
+                plt.imshow(inv_weight_mask[bb,0].detach().cpu()); plt.colorbar(); plt.text(0, 20, "inv_weight_mask", bbox={'facecolor': 'yellow', 'alpha': 0.5}); plt.grid(linestyle=':', linewidth=0.4);
+                plt.tight_layout(); plt.ion(); plt.show();
+            
+            '''
+
+        pred_noccs.append(pred_noccs_scale)
+        curr_noccs.append(curr_noccs_scale)
+
+    return pred_noccs, curr_noccs
+"""
+
+
+def compute_flow_consistency_loss(inv_flows, fwd_flows, args):
+    loss = 0
+    pred_noccs, curr_noccs = [], []
+
+    num_scales = min(len(inv_flows[0]), args.num_scales)
+    for inv_flow, fwd_flow in zip(inv_flows, fwd_flows):
+        pred_noccs_scale, curr_noccs_scale = [], []
+        for s in range(num_scales):
+            inv2fwd_flow, inv2fwd_val = inv_warp(inv_flow[s], fwd_flow[s])
+            fwd2inv_flow, fwd2inv_val = inv_warp(fwd_flow[s], inv_flow[s])
+
+            fwd_flow_diff_norm = ( L2_norm(torch.abs(fwd_flow[s] + inv2fwd_flow)) / L2_norm(torch.abs(fwd_flow[s]) + torch.abs(inv2fwd_flow)).clamp(min=1e-6) ).clamp(0,1)
+            inv_flow_diff_norm = ( L2_norm(torch.abs(inv_flow[s] + fwd2inv_flow)) / L2_norm(torch.abs(fwd_flow[s]) + torch.abs(inv2fwd_flow)).clamp(min=1e-6) ).clamp(0,1)
+
+            fwd_weight_mask = (1 - fwd_flow_diff_norm) * inv2fwd_val
+            inv_weight_mask = (1 - inv_flow_diff_norm) * fwd2inv_val
+
+            pred_noccs_scale.append(inv_weight_mask)
+            curr_noccs_scale.append(fwd_weight_mask)
+
+            loss += 1/2 * (mean_on_mask(fwd_flow_diff_norm, inv2fwd_val) + mean_on_mask(inv_flow_diff_norm, fwd2inv_val))
+            # pdb.set_trace()
+            '''
+                bb = 0
+                plt.close('all')
+                fig = plt.figure(1, figsize=(24, 8))
+                ea1 = 2; ea2 = 4; ii = 1;
+                fig.add_subplot(ea1,ea2,ii); ii += 1;
+                plt.imshow(fwd_flow_diff_norm[bb,0].detach().cpu()); plt.colorbar(); plt.text(0, 20, "fwd_flow_diff_norm", bbox={'facecolor': 'yellow', 'alpha': 0.5}); plt.grid(linestyle=':', linewidth=0.4);
+                fig.add_subplot(ea1,ea2,ii); ii += 1;
+                plt.imshow(inv2fwd_val[bb,0].detach().cpu()); plt.colorbar(); plt.text(0, 20, "inv2fwd_val", bbox={'facecolor': 'yellow', 'alpha': 0.5}); plt.grid(linestyle=':', linewidth=0.4);
+                fig.add_subplot(ea1,ea2,ii); ii += 1;
+                plt.imshow(inv_flow_diff_norm[bb,0].detach().cpu()); plt.colorbar(); plt.text(0, 20, "inv_flow_diff_norm", bbox={'facecolor': 'yellow', 'alpha': 0.5}); plt.grid(linestyle=':', linewidth=0.4);
+                fig.add_subplot(ea1,ea2,ii); ii += 1;
+                plt.imshow(fwd2inv_val[bb,0].detach().cpu()); plt.colorbar(); plt.text(0, 20, "fwd2inv_val", bbox={'facecolor': 'yellow', 'alpha': 0.5}); plt.grid(linestyle=':', linewidth=0.4);
+                plt.tight_layout(); plt.ion(); plt.show();
+
+            '''
+
+        pred_noccs.append(pred_noccs_scale)
+        curr_noccs.append(curr_noccs_scale)
+
+    return loss, pred_noccs, curr_noccs
+
+
+
+def compute_occ_guide_loss(curr_imgs, pred_imgs, inv_flows, fwd_flows, pred_noccs, curr_noccs, args):
+    loss = 0
+
+    num_scales = min(len(inv_flows[0]), args.num_scales)
+    for curr_img, pred_img, inv_flow, fwd_flow, pred_nocc, curr_nocc in zip(curr_imgs, pred_imgs, inv_flows, fwd_flows, pred_noccs, curr_noccs):
+        for s in range(num_scales):
+            b, _, h, w = inv_flow[s].size()
+            curr_img_scaled = F.interpolate(curr_img, (h, w), mode='area')
+            pred_img_scaled = F.interpolate(pred_img, (h, w), mode='area')
+
+            pred_nocc_gt = fwd_warp(curr_img_scaled, fwd_flow[s], upscale=2)[1].detach()
+            curr_nocc_gt = fwd_warp(pred_img_scaled, inv_flow[s], upscale=2)[1].detach()
+
+            cost1 = torch.norm(pred_nocc_gt-pred_nocc[s], 1, dim=1, keepdim=True).mean()
+            cost2 = torch.norm(curr_nocc_gt-curr_nocc[s], 1, dim=1, keepdim=True).mean()
+            # pdb.set_trace()
+            '''
+                bb = 0
+                plt.close('all')
+                plt.figure(1), plt.imshow(pred_nocc_gt[bb,0].detach().cpu()), plt.colorbar(), plt.ion(), plt.show()
+                plt.figure(2), plt.imshow(pred_nocc[s][bb,0].detach().cpu()), plt.colorbar(), plt.ion(), plt.show()
+                plt.figure(3), plt.imshow(curr_nocc_gt[bb,0].detach().cpu()), plt.colorbar(), plt.ion(), plt.show()
+                plt.figure(4), plt.imshow(curr_nocc[s][bb,0].detach().cpu()), plt.colorbar(), plt.ion(), plt.show()
+            
+            '''
+            loss += cost1 + cost2
+
+    return loss
 
 
 def compute_rigid_flow_loss(tgt_img, ref_imgs, r2t_flows, t2r_flows, tgt_depth, ref_depths, r2t_poses, t2r_poses, intrinsics, args):
@@ -137,13 +441,13 @@ def compute_rigid_flow_loss(tgt_img, ref_imgs, r2t_flows, t2r_flows, tgt_depth, 
                 ### dpoint ###
                 
                 plt.close('all'); 
-                bb = 1
+                bb = 0
                 aaa = ref_img[bb].detach().cpu().numpy().transpose(1,2,0) * 0.5 + 0.5
                 bbb = tgt_img[bb].detach().cpu().numpy().transpose(1,2,0) * 0.5 + 0.5
                 ccc = vis_flow(r2t_rig_flow[bb].detach().cpu().numpy().transpose(1,2,0))
                 ddd = vis_flow(r2t_flow[s][bb].detach().cpu().numpy().transpose(1,2,0))
-                eee = flow_warp(ref_img, r2t_rig_flow)[bb].detach().cpu().numpy().transpose(1,2,0) * 0.5 + 0.5
-                fff = flow_warp(ref_img, r2t_flow[s])[bb].detach().cpu().numpy().transpose(1,2,0) * 0.5 + 0.5
+                eee = inv_warp(ref_img, r2t_rig_flow)[bb].detach().cpu().numpy().transpose(1,2,0) * 0.5 + 0.5
+                fff = inv_warp(ref_img, r2t_flow[s])[bb].detach().cpu().numpy().transpose(1,2,0) * 0.5 + 0.5
                 ggg = r2t_rig_flow[bb,0].detach().cpu().numpy()
                 hhh = r2t_flow[s][bb,0].detach().cpu().numpy()
                 iii = np.abs(bbb-eee)
@@ -335,7 +639,6 @@ def compute_fwd_rigid_flow_loss(tgt_img, ref_imgs, r2t_flows, t2r_flows, tgt_dep
             '''
 
     return loss
-
 
 
 

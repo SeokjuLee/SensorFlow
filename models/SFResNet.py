@@ -65,9 +65,9 @@ def downsample_conv(in_planes, out_planes, kernel_size=3):
     )
 
 
-def predict_flow(in_planes):
+def predict_flow(in_planes, out_planes=2):
     return nn.Sequential(
-        nn.Conv2d(in_planes, 2, kernel_size=3, padding=1),
+        nn.Conv2d(in_planes, out_planes, kernel_size=3, padding=1),
         # nn.Sigmoid()
     )
 
@@ -99,11 +99,12 @@ def encode_sensor(in_feats, out_feats):
 
 class SFResNet(nn.Module):
 
-    def __init__(self, alpha=20, dim_motion=7):
+    def __init__(self, alpha=20, dim_motion=7, ch_pred=2):
         super(SFResNet, self).__init__()
 
         self.alpha = alpha
-        self.ns = dim_motion     # Quaternion (4) + Translation (3)
+        self.ns = dim_motion    # Quaternion (4) + Translation (3)
+        self.ch = ch_pred       # predicted channels (x-, y-axis + two-way)?
 
         conv_planes = [32, 64, 128, 256, 512, 512, 512]
         self.conv1 = downsample_conv(3,              conv_planes[0], kernel_size=7)
@@ -127,16 +128,16 @@ class SFResNet(nn.Module):
         self.jconv6 = make_layer(upconv_planes[1] + conv_planes[4], BasicBlock, upconv_planes[1], blocks=2, stride=1)
         self.jconv5 = make_layer(upconv_planes[2] + conv_planes[3], BasicBlock, upconv_planes[2], blocks=2, stride=1)
         self.jconv4 = make_layer(upconv_planes[3] + conv_planes[2], BasicBlock, upconv_planes[3], blocks=2, stride=1)
-        self.jconv3 = make_layer(2 + upconv_planes[4] + conv_planes[1], BasicBlock, upconv_planes[4], blocks=1, stride=1)
-        self.jconv2 = make_layer(2 + upconv_planes[5] + conv_planes[0], BasicBlock, upconv_planes[5], blocks=1, stride=1)
-        self.jconv1 = make_layer(2 + upconv_planes[6], BasicBlock, upconv_planes[6], blocks=1, stride=1)
+        self.jconv3 = make_layer(self.ch + upconv_planes[4] + conv_planes[1], BasicBlock, upconv_planes[4], blocks=1, stride=1)
+        self.jconv2 = make_layer(self.ch + upconv_planes[5] + conv_planes[0], BasicBlock, upconv_planes[5], blocks=1, stride=1)
+        self.jconv1 = make_layer(self.ch + upconv_planes[6], BasicBlock, upconv_planes[6], blocks=1, stride=1)
 
-        self.predict_flow6 = predict_flow(upconv_planes[1])
-        self.predict_flow5 = predict_flow(upconv_planes[2])
-        self.predict_flow4 = predict_flow(upconv_planes[3])
-        self.predict_flow3 = predict_flow(upconv_planes[4])
-        self.predict_flow2 = predict_flow(upconv_planes[5])
-        self.predict_flow1 = predict_flow(upconv_planes[6])
+        self.predict_flow6 = predict_flow(upconv_planes[1], self.ch)
+        self.predict_flow5 = predict_flow(upconv_planes[2], self.ch)
+        self.predict_flow4 = predict_flow(upconv_planes[3], self.ch)
+        self.predict_flow3 = predict_flow(upconv_planes[4], self.ch)
+        self.predict_flow2 = predict_flow(upconv_planes[5], self.ch)
+        self.predict_flow1 = predict_flow(upconv_planes[6], self.ch)
 
         self.linear1 = encode_sensor(self.ns, 16)
         self.linear2 = encode_sensor(16, 32)
@@ -159,13 +160,13 @@ class SFResNet(nn.Module):
         '''
 
         """ Encoder """
-        out_conv1 = self.conv1(x1)
-        out_conv2 = self.conv2(out_conv1)
-        out_conv3 = self.conv3(out_conv2)
-        out_conv4 = self.conv4(out_conv3)
-        out_conv5 = self.conv5(out_conv4)
-        out_conv6 = self.conv6(out_conv5)
-        out_conv7 = self.conv7(out_conv6)
+        out_conv1 = self.conv1(x1)          # torch.Size([b, 32, 224, 352])
+        out_conv2 = self.conv2(out_conv1)   # torch.Size([b, 64, 112, 176])
+        out_conv3 = self.conv3(out_conv2)   # torch.Size([b, 128, 56, 88])
+        out_conv4 = self.conv4(out_conv3)   # torch.Size([b, 256, 28, 44])
+        out_conv5 = self.conv5(out_conv4)   # torch.Size([b, 512, 14, 22])
+        out_conv6 = self.conv6(out_conv5)   # torch.Size([b, 512, 7, 11])
+        out_conv7 = self.conv7(out_conv6)   # torch.Size([b, 512, 4, 6])
 
         bb, _, hh, ww = out_conv7.size()
 
